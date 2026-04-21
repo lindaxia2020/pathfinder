@@ -2,6 +2,15 @@
 
 PathFinder is an autonomous AI-powered job discovery and matching system designed for Technical Program Manager (TPM) candidates. It automates the end-to-end workflow of finding AI companies, discovering TPM positions, evaluating resume-job fit, and tailoring resumes for top matches.
 
+> 📌 **For recruiters & hiring managers** — see **[PROJECT_OVERVIEW.md](PROJECT_OVERVIEW.md)** for a curated technical overview: why the project exists, what the runtime pipeline does, how it was built with Claude Code + 11 AI subagents, and what competencies it demonstrates.
+
+## At a Glance
+
+- **What it is:** A 4-agent LLM pipeline — **Discover → Extract → Match → Tailor** — that automates AI-TPM job search end-to-end.
+- **How it was built:** I made all architecture, scope, and review decisions; used **Claude Code (Opus)** as implementation partner and designed an **11-agent Claude subagent review team** (PM, TPM, 9 QA/Eval/Cost reviewers) for parallel review across a full SDLC.
+- **Scale signals:** ~4K lines of Python · 485+ unit tests · Pydantic-typed inter-agent contracts · Gemini API pooling + token-bucket rate limiting · full BRD / Tech Design / Test / Launch artifacts under `docs/sdlc/`.
+- **Stack:** Python 3.11 · Gemini · Claude Code · Tavily · Firecrawl · Crawl4AI · Pydantic · openpyxl · pytest.
+
 ## How It Works
 
 The system runs four independent agents in sequence:
@@ -72,13 +81,13 @@ Place your resume (`.md` or `.txt`) in the `profile/` directory before running t
 
 ## AI SDLC Development Team
 
-This project uses a 12-member AI agent team to manage its own development lifecycle. At the center is **Claude Code (Opus)**, which serves as both **Tech Lead** and **Implementation Agent** — making architecture decisions, writing code and tests, and orchestrating the other 11 specialist agents on demand. All agents and skills are defined in the `.claude/` directory.
+This project is delivered via AI-augmented program management. I hold all architecture, scope, and review authority. **Claude Code (Opus)** serves as my **implementation partner** — executing against my specs, and dispatching the 11 read-only specialist subagents I designed for parallel review across code, prompts, schemas, tests, docs, evaluation, observability, and cost. All agent definitions and skills are in the `.claude/` directory.
 
 ### The Team
 
 | Role | Agent | Model | Purpose |
 |------|-------|-------|---------|
-| **Tech Lead + Implementer** | **Claude Code** | **Opus** | **Architecture decisions, code implementation, test authoring, team coordination — the only agent with write access** |
+| **Implementation Partner** | **Claude Code** | **Opus** | **Executes code, tests, and docs against my specs; sole write access; dispatches the 11 review subagents on my priorities** |
 | Planning | Product Manager | Sonnet | BRD authoring, feasibility analysis, testing sign-off |
 | Planning | TPM | Opus | Task decomposition, cross-team coordination, risk management, launch readiness |
 | QA | Agent Reviewer | Opus | Code quality review, prompt design, cross-agent consistency |
@@ -91,7 +100,7 @@ This project uses a 12-member AI agent team to manage its own development lifecy
 | Eval | Observability | Sonnet | Pipeline run reporting, data quality drift, anomaly alerting |
 | Eval | Cost | Sonnet | API token usage estimation, quota monitoring, cost optimization |
 
-> **Key distinction:** Claude Code is the only agent with code write permissions. The other 11 agents are strictly read-only (analysis, reporting, and review), dispatched by Claude Code as needed.
+> **Key distinction:** I hold all design and review authority. Claude Code is the only agent with code write permissions. The other 11 agents are strictly read-only (analysis, reporting, and review), dispatched by Claude Code under my direction.
 
 ### Skills
 
