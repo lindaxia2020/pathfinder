@@ -32,6 +32,7 @@ from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
+from shared.run_summary import RunSummary
 from shared.prompts import (
     FINE_SYSTEM_PROMPT, BATCH_FINE_SYSTEM_PROMPT,
     TAILOR_SYSTEM_PROMPT, BATCH_TAILOR_SYSTEM_PROMPT,
@@ -274,6 +275,24 @@ def re_score(tailored_resume: str, jd_content: str) -> str | None:
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 async def main():
+    summary = RunSummary(agent="optimizer")
+    try:
+        await _main_inner(summary)
+    except GeminiTransientError as e:
+        summary.transient_errors += 1
+        summary.note(f"Run aborted (transient): {e}")
+        raise
+    except Exception as e:
+        summary.note(f"Run aborted: {type(e).__name__}: {e}")
+        raise
+    finally:
+        summary.mark_finished()
+        log_path = summary.write()
+        print(f"📊 Run summary: {log_path}")
+        print(summary.to_json())
+
+
+async def _main_inner(summary: RunSummary):
     global _KEY_POOL
     gemini_keys = [k for k in [
         os.getenv("GEMINI_API_KEY"),
@@ -281,6 +300,7 @@ async def main():
     ] if k]
     if not gemini_keys:
         print("Missing GEMINI_API_KEY in .env")
+        summary.note("Missing GEMINI_API_KEY")
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
@@ -335,6 +355,8 @@ async def main():
     print(f"Scored matches (score >= 0): {len(scored)}")
     print(f"Already optimized:          {len(scored) - len(to_process)}")
     print(f"To process:                 {len(to_process)}\n")
+    summary.skipped += len(scored) - len(to_process)
+    summary.attempted += len(to_process)
 
     if not to_process:
         print("All matches already optimized. Nothing to do.")
@@ -404,6 +426,7 @@ async def main():
             # P0-4: None = structural error; drop the record (do not write empty MD).
             if tailor_json is None:
                 logging.error(f"  Fallback tailor also failed for {item['url']} (structural)")
+                summary.structural_errors += 1
                 continue
             try:
                 data = json.loads(tailor_json)
@@ -417,6 +440,7 @@ async def main():
                     _save_tailored_resume(resume_id, url, md)
             except Exception as e:
                 logging.error(f"  Fallback tailor parse failed for {item['url']}: {e}")
+                summary.structural_errors += 1
 
     print(f"\n[Phase 1 done] {len(tailor_results)}/{len(job_items)} resumes tailored.")
 
@@ -465,11 +489,13 @@ async def main():
             # P0-4: None = structural error; drop the record (do not write fake score=0).
             if score_json is None:
                 logging.error(f"  Fallback re-score failed for {url} (structural); dropping record.")
+                summary.structural_errors += 1
                 continue
             try:
                 score_results[url] = json.loads(score_json)
             except Exception as e:
                 logging.error(f"  Fallback re-score parse failed for {url}: {e}; dropping record.")
+                summary.structural_errors += 1
 
     # ── Phase 3: Assemble results + write Excel ────────────────────
     results: list[dict] = []
@@ -507,6 +533,8 @@ async def main():
     if results:
         batch_upsert_tailored_records(xlsx_path, results)
         logging.info(f"Wrote {len(results)} tailored records.")
+    summary.succeeded += len(results)
+    summary.failed += max(0, len(to_process) - len(results))
 
     api_calls = n_tailor_batches + n_rescore_batches + len(tailor_fallback) + len(score_fallback)
     old_calls = total * 2

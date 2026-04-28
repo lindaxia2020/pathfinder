@@ -40,6 +40,8 @@ from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL, AUTO_ARCHIVE_THRESHOLD
 from shared.prompts import SECURITY_CLAUSE
+from shared.run_summary import RunSummary
+from shared.exceptions import GeminiTransientError
 
 
 # BUG-31: use _GeminiKeyPoolBase directly with genai_mod parameter
@@ -1586,6 +1588,24 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
+    summary = RunSummary(agent="job")
+    try:
+        await _main_inner(summary)
+    except GeminiTransientError as e:
+        summary.transient_errors += 1
+        summary.note(f"Run aborted (transient): {e}")
+        raise
+    except Exception as e:
+        summary.note(f"Run aborted: {type(e).__name__}: {e}")
+        raise
+    finally:
+        summary.mark_finished()
+        log_path = summary.write()
+        print(f"📊 Run summary: {log_path}")
+        print(summary.to_json())
+
+
+async def _main_inner(summary: RunSummary):
     global _KEY_POOL
     gemini_keys = [k for k in [
         os.getenv("GEMINI_API_KEY"),
@@ -1594,9 +1614,11 @@ async def main():
     fc_key = os.getenv("FIRECRAWL_API_KEY")
     if not gemini_keys:
         print("❌ Missing env var: GEMINI_API_KEY")
+        summary.note("Missing GEMINI_API_KEY")
         return
     if not fc_key:
         print("❌ Missing env var: FIRECRAWL_API_KEY")
+        summary.note("Missing FIRECRAWL_API_KEY")
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
@@ -1617,7 +1639,9 @@ async def main():
 
     if not companies:
         print("⚠️  No companies in list. Run company_agent.py first.")
+        summary.note("No companies in list")
         return
+    summary.attempted = len(companies)
 
     # REQ-063: skip auto-archived companies
     archived_set = get_archived_companies(xlsx_path)
@@ -1652,6 +1676,9 @@ async def main():
                 for res in batch_results:
                     if isinstance(res, Exception):
                         logging.error(f"[ProcessCompany] Error: {res}")
+                        summary.failed += 1
+                    else:
+                        summary.succeeded += 1
 
         # ── Phase: Retry incomplete JD records ─────────────────────────────────
         incomplete = get_incomplete_jd_rows(xlsx_path)

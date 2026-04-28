@@ -595,8 +595,9 @@ class TestBug42QuotaExhaustionWarning(unittest.TestCase):
     def test_retry_phase_surfaces_quota_errors(self):
         """Verify retry phase also surfaces quota errors."""
         import inspect
-        from agents.job_agent import main
-        source = inspect.getsource(main)
+        # P0-7: main() is now a thin RunSummary wrapper; orchestration body in _main_inner.
+        from agents.job_agent import _main_inner
+        source = inspect.getsource(_main_inner)
         self.assertIn("retry_quota_errors", source,
                       "retry phase must track quota errors")
 

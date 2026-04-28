@@ -334,7 +334,8 @@ class TestJobAgentMain(unittest.IsolatedAsyncioTestCase):
         Verifies via source inspection that get_incomplete_jd_rows is called
         within the indentation level of the async with block.
         """
-        source = inspect.getsource(job_mod.main)
+        # P0-7: main() is now a thin RunSummary wrapper; orchestration body in _main_inner.
+        source = inspect.getsource(job_mod._main_inner)
         lines = source.split("\n")
 
         # Find the 'async with AsyncWebCrawler' line
@@ -374,7 +375,8 @@ class TestJobAgentMain(unittest.IsolatedAsyncioTestCase):
         1. A guard checking parsed.get("company") — skip if Gemini returns empty data
         2. A guard checking extracted_loc/extracted_reqs/extracted_resp — skip if still incomplete
         """
-        source = inspect.getsource(job_mod.main)
+        # P0-7: main() is now a thin RunSummary wrapper; orchestration body in _main_inner.
+        source = inspect.getsource(job_mod._main_inner)
 
         # Guard 1: skip when Gemini returns empty data (no "company" field)
         self.assertIn('parsed.get("company")', source,
@@ -729,6 +731,73 @@ class TestEndToEndDataFlow(unittest.TestCase):
         self.assertEqual(match["jd_url"], url)
         self.assertGreaterEqual(match["score"], 0)
         self.assertTrue(match["resume_hash"])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestRunSummaryWritten(unittest.TestCase):
+    """P0-7: every agent's main() writes a structured RunSummary on completion
+    (success or early-return path), so an 80%-failed run is observably distinct
+    from a clean success in run_logs/."""
+
+    def setUp(self):
+        import shutil
+        self.tmpdir = tempfile.mkdtemp(prefix="pf-runlogs-test-")
+        self.cwd = os.getcwd()
+        os.chdir(self.tmpdir)
+
+    def tearDown(self):
+        import shutil
+        os.chdir(self.cwd)
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _read_latest_summary(self, agent: str) -> dict:
+        log_dir = os.path.join(self.tmpdir, "run_logs")
+        files = [f for f in os.listdir(log_dir) if f.startswith(f"{agent}-")]
+        self.assertEqual(len(files), 1, f"expected exactly one {agent}-*.json")
+        with open(os.path.join(log_dir, files[0])) as f:
+            return json.load(f)
+
+    def test_company_main_writes_run_summary(self):
+        # Force an early-return path with no env keys; summary still gets written.
+        with patch.dict(os.environ, {}, clear=True):
+            company_mod.main()
+        payload = self._read_latest_summary("company")
+        self.assertEqual(payload["agent"], "company")
+        self.assertIn("run_id", payload)
+        self.assertIsNotNone(payload["finished_at"])
+        # The early-return path adds a 'Missing env vars' note.
+        self.assertTrue(any("Missing" in n for n in payload["notes"]))
+
+    def test_match_main_writes_run_summary(self):
+        with patch.dict(os.environ, {}, clear=True):
+            asyncio.run(match_mod.main())
+        payload = self._read_latest_summary("match")
+        self.assertEqual(payload["agent"], "match")
+        self.assertIsNotNone(payload["finished_at"])
+
+    def test_optimizer_main_writes_run_summary(self):
+        with patch.dict(os.environ, {}, clear=True):
+            asyncio.run(optimizer_mod.main())
+        payload = self._read_latest_summary("optimizer")
+        self.assertEqual(payload["agent"], "optimizer")
+        self.assertIsNotNone(payload["finished_at"])
+
+    def test_job_main_writes_run_summary(self):
+        with patch.dict(os.environ, {}, clear=True):
+            asyncio.run(job_mod.main())
+        payload = self._read_latest_summary("job")
+        self.assertEqual(payload["agent"], "job")
+        self.assertIsNotNone(payload["finished_at"])
+
+    def test_run_summary_has_all_counter_fields(self):
+        """Every counter field must be present so log consumers can grep them."""
+        with patch.dict(os.environ, {}, clear=True):
+            company_mod.main()
+        payload = self._read_latest_summary("company")
+        for field in ("attempted", "succeeded", "failed", "skipped",
+                      "transient_errors", "structural_errors"):
+            self.assertIn(field, payload)
+            self.assertIsInstance(payload[field], int)
 
 
 if __name__ == "__main__":
