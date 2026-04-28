@@ -165,9 +165,13 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=(f"--- CANDIDATE PROFILE ---\n{resume_text}\n\n"
-                      f"--- JDs TO SCORE ---\n{numbered}\n\n"
-                      "Return BatchCoarseResult JSON with one CoarseItem per JD."),
+            contents=(
+                "--- CANDIDATE PROFILE ---\n"
+                f"<scraped_content>\n{resume_text}\n</scraped_content>\n\n"
+                "--- JDs TO SCORE ---\n"
+                f"<scraped_content>\n{numbered}\n</scraped_content>\n\n"
+                "Return BatchCoarseResult JSON with one CoarseItem per JD."
+            ),
             config=cfg,
         )
         result = BatchCoarseResult.model_validate_json(resp.text)
@@ -194,9 +198,13 @@ def evaluate_match(resume_text: str, jd_json: str) -> str:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=(f"--- CANDIDATE PROFILE ---\n{resume_text}\n\n"
-                      f"--- TARGET JD ---\n{jd_json}\n\n"
-                      "Provide MatchResult JSON."),
+            contents=(
+                "--- CANDIDATE PROFILE ---\n"
+                f"<scraped_content>\n{resume_text}\n</scraped_content>\n\n"
+                "--- TARGET JD ---\n"
+                f"<scraped_content>\n{jd_json}\n</scraped_content>\n\n"
+                "Provide MatchResult JSON."
+            ),
             config=cfg,
         )
         return resp.text
