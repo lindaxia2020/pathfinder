@@ -190,10 +190,17 @@ class TestTailorResume(unittest.TestCase):
         self.assertIn("tailored_resume_markdown", data)
         self.assertEqual(data["tailored_resume_markdown"], "# Tailored Resume")
 
-    def test_returns_empty_dict_on_exception(self):
-        optimizer_mod._KEY_POOL.generate_content.side_effect = Exception("fail")
-        result = tailor_resume("resume", "jd")
-        self.assertEqual(result, "{}")
+    def test_returns_none_on_structural_error(self):
+        """P0-4: structural error returns None, not '{}' fake JSON."""
+        from shared.exceptions import GeminiStructuralError
+        optimizer_mod._KEY_POOL.generate_content.side_effect = GeminiStructuralError("bad")
+        self.assertIsNone(tailor_resume("resume", "jd"))
+
+    def test_reraises_transient_error(self):
+        from shared.exceptions import GeminiTransientError
+        optimizer_mod._KEY_POOL.generate_content.side_effect = GeminiTransientError("429")
+        with self.assertRaises(GeminiTransientError):
+            tailor_resume("resume", "jd")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -219,10 +226,17 @@ class TestReScore(unittest.TestCase):
         data = json.loads(result)
         self.assertEqual(data["compatibility_score"], 85)
 
-    def test_returns_empty_dict_on_exception(self):
-        optimizer_mod._KEY_POOL.generate_content.side_effect = Exception("fail")
-        result = re_score("resume", "jd")
-        self.assertEqual(result, "{}")
+    def test_returns_none_on_structural_error(self):
+        """P0-4: structural error returns None, not '{}' fake JSON."""
+        from shared.exceptions import GeminiStructuralError
+        optimizer_mod._KEY_POOL.generate_content.side_effect = GeminiStructuralError("bad")
+        self.assertIsNone(re_score("resume", "jd"))
+
+    def test_reraises_transient_error(self):
+        from shared.exceptions import GeminiTransientError
+        optimizer_mod._KEY_POOL.generate_content.side_effect = GeminiTransientError("429")
+        with self.assertRaises(GeminiTransientError):
+            re_score("resume", "jd")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,10 +296,18 @@ class TestBatchTailorResume(unittest.TestCase):
         self.assertEqual(results[0]["tailored_resume_markdown"], "# Tailored0")
         self.assertEqual(results[1]["tailored_resume_markdown"], "# Tailored1")
 
-    def test_returns_empty_dicts_on_exception(self):
-        self.mock_pool.generate_content.side_effect = Exception("API error")
+    def test_returns_empty_dicts_on_structural_error(self):
+        """P0-4: structural error yields empty dict per JD; not fake content."""
+        from shared.exceptions import GeminiStructuralError
+        self.mock_pool.generate_content.side_effect = GeminiStructuralError("bad")
         results = batch_tailor_resume("resume", ["jd0", "jd1"])
         self.assertEqual(results, [{}, {}])
+
+    def test_reraises_transient_error(self):
+        from shared.exceptions import GeminiTransientError
+        self.mock_pool.generate_content.side_effect = GeminiTransientError("429")
+        with self.assertRaises(GeminiTransientError):
+            batch_tailor_resume("resume", ["jd0", "jd1"])
 
     def test_missing_index_returns_empty_dict(self):
         """Gemini returns only index 1, index 0 should be empty."""
@@ -344,13 +366,24 @@ class TestBatchReScore(unittest.TestCase):
         self.assertEqual(results[0]["compatibility_score"], 85)
         self.assertEqual(results[1]["compatibility_score"], 70)
 
-    def test_returns_zero_scores_on_exception(self):
-        self.mock_pool.generate_content.side_effect = Exception("fail")
+    def test_returns_empty_dicts_on_structural_error(self):
+        """P0-4: structural errors yield empty-dict sentinel, never fake compatibility_score=0."""
+        from shared.exceptions import GeminiStructuralError
+        self.mock_pool.generate_content.side_effect = GeminiStructuralError("bad")
         pairs = [{"tailored_resume": "r0", "jd_content": "jd0"}]
         results = batch_re_score(pairs)
-        self.assertEqual(results, [{"compatibility_score": 0}])
+        self.assertEqual(results, [{}])
 
-    def test_missing_index_gets_default_score(self):
+    def test_reraises_transient_error(self):
+        from shared.exceptions import GeminiTransientError
+        self.mock_pool.generate_content.side_effect = GeminiTransientError("429")
+        with self.assertRaises(GeminiTransientError):
+            batch_re_score([{"tailored_resume": "r", "jd_content": "j"}])
+
+    def test_missing_index_gets_empty_dict(self):
+        """P0-4: index missing from Gemini response yields empty-dict sentinel,
+        not a fake compatibility_score=0. Caller routes empty dicts to the
+        per-item fallback path."""
         self.mock_pool.generate_content.return_value = MagicMock(
             text=json.dumps({
                 "items": [
@@ -364,7 +397,7 @@ class TestBatchReScore(unittest.TestCase):
             {"tailored_resume": "r1", "jd_content": "jd1"},
         ]
         results = batch_re_score(pairs)
-        self.assertEqual(results[0], {"compatibility_score": 0})
+        self.assertEqual(results[0], {})
         self.assertEqual(results[1]["compatibility_score"], 90)
 
 

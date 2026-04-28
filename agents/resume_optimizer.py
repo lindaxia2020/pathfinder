@@ -31,6 +31,7 @@ from shared.excel_store import (
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL
+from shared.exceptions import GeminiTransientError, GeminiStructuralError
 from shared.prompts import (
     FINE_SYSTEM_PROMPT, BATCH_FINE_SYSTEM_PROMPT,
     TAILOR_SYSTEM_PROMPT, BATCH_TAILOR_SYSTEM_PROMPT,
@@ -111,8 +112,12 @@ def _save_tailored_resume(resume_id: str, url: str, content: str) -> str:
 
 
 # ── Gemini calls ─────────────────────────────────────────────────────────────
-def tailor_resume(resume_text: str, jd_content: str) -> str:
-    """Call Gemini to tailor resume for a specific JD. Returns JSON string."""
+def tailor_resume(resume_text: str, jd_content: str) -> str | None:
+    """Call Gemini to tailor resume for a specific JD. Returns JSON string.
+
+    P0-4: returns None on structural error so the caller can drop the
+    record. Transient errors propagate as GeminiTransientError.
+    """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking tailor_resume()")
     cfg = types.GenerateContentConfig(
@@ -134,9 +139,11 @@ def tailor_resume(resume_text: str, jd_content: str) -> str:
             config=cfg,
         )
         return resp.text
-    except Exception as e:
-        logging.error(f"Tailor resume failed: {e}")
-        return "{}"
+    except GeminiTransientError:
+        raise
+    except GeminiStructuralError as e:
+        logging.error(f"Tailor resume structural failure (record dropped): {e}")
+        return None
 
 
 def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
@@ -173,8 +180,13 @@ def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
                     "optimization_summary": item.optimization_summary,
                 }
         return out
+    except GeminiTransientError:
+        raise
+    except GeminiStructuralError as e:
+        logging.error(f"Batch tailor structural failure (skipping {len(jd_contents)} jobs): {e}")
+        return [{} for _ in range(len(jd_contents))]
     except Exception as e:
-        logging.error(f"Batch tailor failed: {e}")
+        logging.error(f"Batch tailor response parse failed (skipping {len(jd_contents)} jobs): {e}")
         return [{} for _ in range(len(jd_contents))]
 
 
@@ -203,7 +215,10 @@ def batch_re_score(pairs: list[dict]) -> list[dict]:
             config=cfg,
         )
         result = BatchMatchResult.model_validate_json(resp.text)
-        out: list[dict] = [{"compatibility_score": 0} for _ in range(len(pairs))]
+        # P0-4: missing items stay as {} (sentinel for "no real score") so the
+        # caller can route them to the per-item fallback path. Previous code
+        # used {"compatibility_score": 0} which silently wrote a fake 0.
+        out: list[dict] = [{} for _ in range(len(pairs))]
         for item in result.items:
             if 0 <= item.index < len(pairs):
                 out[item.index] = {
@@ -213,13 +228,22 @@ def batch_re_score(pairs: list[dict]) -> list[dict]:
                     "recommendation_reason": item.recommendation_reason,
                 }
         return out
+    except GeminiTransientError:
+        raise
+    except GeminiStructuralError as e:
+        logging.error(f"Batch re-score structural failure (skipping {len(pairs)} pairs): {e}")
+        return [{} for _ in range(len(pairs))]
     except Exception as e:
-        logging.error(f"Batch re-score failed: {e}")
-        return [{"compatibility_score": 0} for _ in range(len(pairs))]
+        logging.error(f"Batch re-score response parse failed (skipping {len(pairs)} pairs): {e}")
+        return [{} for _ in range(len(pairs))]
 
 
-def re_score(tailored_resume: str, jd_content: str) -> str:
-    """Re-score the tailored resume using the same fine-evaluation prompt."""
+def re_score(tailored_resume: str, jd_content: str) -> str | None:
+    """Re-score the tailored resume using the same fine-evaluation prompt.
+
+    P0-4: returns None on structural error so the caller can drop the
+    record. Transient errors propagate as GeminiTransientError.
+    """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking re_score()")
     cfg = types.GenerateContentConfig(
@@ -241,9 +265,11 @@ def re_score(tailored_resume: str, jd_content: str) -> str:
             config=cfg,
         )
         return resp.text
-    except Exception as e:
-        logging.error(f"Re-score failed: {e}")
-        return "{}"
+    except GeminiTransientError:
+        raise
+    except GeminiStructuralError as e:
+        logging.error(f"Re-score structural failure (record dropped): {e}")
+        return None
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -375,6 +401,10 @@ async def main():
             tailor_json = await asyncio.to_thread(
                 tailor_resume, resume_text, item["jd_content"]
             )
+            # P0-4: None = structural error; drop the record (do not write empty MD).
+            if tailor_json is None:
+                logging.error(f"  Fallback tailor also failed for {item['url']} (structural)")
+                continue
             try:
                 data = json.loads(tailor_json)
                 md = data.get("tailored_resume_markdown", "")
@@ -385,8 +415,8 @@ async def main():
                         "opt_summary": data.get("optimization_summary", ""),
                     }
                     _save_tailored_resume(resume_id, url, md)
-            except Exception:
-                logging.error(f"  Fallback tailor also failed for {item['url']}")
+            except Exception as e:
+                logging.error(f"  Fallback tailor parse failed for {item['url']}: {e}")
 
     print(f"\n[Phase 1 done] {len(tailor_results)}/{len(job_items)} resumes tailored.")
 
@@ -432,10 +462,14 @@ async def main():
             score_json = await asyncio.to_thread(
                 re_score, tailor_results[url]["tailored_md"], item["jd_content"]
             )
+            # P0-4: None = structural error; drop the record (do not write fake score=0).
+            if score_json is None:
+                logging.error(f"  Fallback re-score failed for {url} (structural); dropping record.")
+                continue
             try:
                 score_results[url] = json.loads(score_json)
-            except Exception:
-                score_results[url] = {"compatibility_score": 0}
+            except Exception as e:
+                logging.error(f"  Fallback re-score parse failed for {url}: {e}; dropping record.")
 
     # ── Phase 3: Assemble results + write Excel ────────────────────
     results: list[dict] = []

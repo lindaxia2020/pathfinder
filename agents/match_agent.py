@@ -57,6 +57,7 @@ def _load_jd_markdown(url: str) -> str | None:
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL
+from shared.exceptions import GeminiTransientError, GeminiStructuralError
 
 # BUG-41: single shared limiter across Stage 1 and Stage 2
 _GEMINI_LIMITER = _RateLimiter(rpm=13)
@@ -150,7 +151,13 @@ def _format_jd_for_coarse(jd: dict) -> str:
 
 
 def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
-    """Send resume + up to 10 JDs in one Gemini call; return list of int scores."""
+    """Send resume + up to 10 JDs in one Gemini call; return list of int scores.
+
+    P0-4: returns [] (empty list) on a structural error so the caller can
+    drop the affected JDs without writing fake score=1 records. Transient
+    errors propagate as GeminiTransientError — the caller should let them
+    bubble up to main() so the run fails loudly.
+    """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking batch_coarse_score()")
     numbered = "\n\n".join(
@@ -180,13 +187,24 @@ def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
             if 0 <= item.index < len(jds_batch):
                 scores[item.index] = max(1, item.score)
         return scores
+    except GeminiTransientError:
+        raise
+    except GeminiStructuralError as e:
+        logging.error(f"Batch coarse score structural failure (skipping {len(jds_batch)} JDs): {e}")
+        return []
     except Exception as e:
-        logging.error(f"Batch coarse score failed: {e}")
-        return [1] * len(jds_batch)
+        # JSON / Pydantic validation on the response text — also structural.
+        logging.error(f"Batch coarse score response parse failed (skipping {len(jds_batch)} JDs): {e}")
+        return []
 
 
 # ── Stage 2: fine match evaluation ───────────────────────────────────────────
-def evaluate_match(resume_text: str, jd_json: str) -> str:
+def evaluate_match(resume_text: str, jd_json: str) -> str | None:
+    """Run Stage 2 fine evaluation. Returns Gemini JSON string on success.
+
+    P0-4: returns None on structural error so the caller can drop the
+    record. Transient errors propagate as GeminiTransientError.
+    """
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking evaluate_match()")
     cfg = types.GenerateContentConfig(
@@ -208,14 +226,11 @@ def evaluate_match(resume_text: str, jd_json: str) -> str:
             config=cfg,
         )
         return resp.text
-    except Exception as e:
-        logging.error(f"Fine match eval failed: {e}")
-        return json.dumps({
-            "compatibility_score": 1,
-            "key_strengths": [],
-            "critical_gaps": ["Evaluation failed — default minimum score."],
-            "recommendation_reason": "Fine evaluation error; assigned minimum score.",
-        })
+    except GeminiTransientError:
+        raise
+    except GeminiStructuralError as e:
+        logging.error(f"Fine match eval structural failure (record dropped): {e}")
+        return None
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -306,21 +321,32 @@ async def main():
             print(f"[Coarse batch {b+1}/{n_batches}] Scoring {len(batch)} JDs...")
             await limiter.acquire()
             scores = await asyncio.to_thread(batch_coarse_score, resume_text, batch)
+            # P0-4: empty list = structural error; do not write fake score=1.
+            if not scores:
+                logging.warning(
+                    f"[Stage1] Batch {b+1} returned no scores (structural error); "
+                    f"skipping {len(batch)} JD(s)."
+                )
+                continue
             for jd, score in zip(batch, scores):
                 coarse_scores[jd["url"]] = score
             logging.info(f"[Stage1] Batch {b+1} scores: {scores}")
 
+        # Only write records for JDs that received a real score.
         coarse_records = [
             (resume_id, jd["url"], json.dumps({
-                "compatibility_score": coarse_scores.get(jd["url"], 1),
+                "compatibility_score": coarse_scores[jd["url"]],
                 "key_strengths": [],
                 "critical_gaps": [],
                 "recommendation_reason": "Coarse screening score — pending fine evaluation.",
             }), resume_hash, "coarse")
             for jd in pass_jds
+            if jd["url"] in coarse_scores
         ]
-        batch_upsert_match_records(xlsx_path, coarse_records)
-        logging.info(f"[Stage1] Wrote {len(coarse_records)} coarse records.")
+        if coarse_records:
+            batch_upsert_match_records(xlsx_path, coarse_records)
+        logging.info(f"[Stage1] Wrote {len(coarse_records)} coarse records "
+                     f"(skipped {len(pass_jds) - len(coarse_records)} due to structural errors).")
 
     # ── Stage 2: fine evaluation of top 20% coarse-scored JDs ─────────────────
     all_pairs = get_match_pairs(xlsx_path)
@@ -368,14 +394,21 @@ async def main():
                 result_json = await asyncio.to_thread(
                     evaluate_match, resume_text, jd_content
                 )
+                # P0-4: structural error — drop the record, keep coarse score in Excel.
+                if result_json is None:
+                    print(f"    Structural error; record dropped (coarse score kept).")
+                    return
                 try:
                     parsed = json.loads(result_json)
                     score = max(1, parsed.get("compatibility_score", 1))
                     if parsed.get("compatibility_score", 1) < 1:
                         parsed["compatibility_score"] = score
                         result_json = json.dumps(parsed)
-                except Exception:
-                    score = 1
+                except Exception as e:
+                    # JSON parse on Gemini response with response_schema set is
+                    # essentially never structural — but if it does happen, drop.
+                    logging.error(f"[Fine] Response parse failed for {url}: {e}")
+                    return
                 fine_records.append((resume_id, url, result_json, resume_hash, "fine"))
                 print(f"    Score: {score}/100")
 
