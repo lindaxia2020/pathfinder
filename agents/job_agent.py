@@ -39,6 +39,7 @@ from shared.excel_store import (
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL, AUTO_ARCHIVE_THRESHOLD
+from shared.prompts import SECURITY_CLAUSE
 
 
 # BUG-31: use _GeminiKeyPoolBase directly with genai_mod parameter
@@ -743,6 +744,7 @@ def llm_filter_jobs(company: str, links: list) -> list:
             "Reject TPM roles in Finance, HR, Legal, Marketing, or general non-AI engineering. "
             "Reject Product Manager, Engineering Manager, Project Manager, and similar titles. "
             "Reject ghost/closed/404 links."
+            + SECURITY_CLAUSE
         ),
         temperature=0.0,
         response_mime_type="application/json",
@@ -751,7 +753,11 @@ def llm_filter_jobs(company: str, links: list) -> list:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=f"Company: {company}\nJobs:\n{json.dumps(links)}\n\nExtract AI TPM URLs.",
+            contents=(
+                f"Company: {company}\nJobs:\n"
+                f"<scraped_content>\n{json.dumps(links)}\n</scraped_content>\n\n"
+                "Extract AI TPM URLs."
+            ),
             config=cfg,
         )
         return json.loads(resp.text).get("urls", [])
@@ -1326,6 +1332,7 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
                      "for AI workloads, or chips/semiconductors. "
                      "Be strict — TPM roles in Finance, HR, Legal, Marketing, or general "
                      "software engineering do NOT qualify." + _common_instr)
+    sys_instr += SECURITY_CLAUSE  # P0-3: prompt-injection guard
     cfg = types.GenerateContentConfig(
         system_instruction=sys_instr,
         temperature=0.05,
@@ -1335,7 +1342,10 @@ def extract_jd(markdown: str, company: str = "", ai_domain: str = "") -> str:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=f"Company: {company}\n\n{markdown}",
+            contents=(
+                f"Company: {company}\n\n"
+                f"<scraped_content>\n{markdown}\n</scraped_content>"
+            ),
             config=cfg,
         )
         return resp.text

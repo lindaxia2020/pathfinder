@@ -124,9 +124,13 @@ def tailor_resume(resume_text: str, jd_content: str) -> str:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=(f"--- ORIGINAL RESUME ---\n{resume_text}\n\n"
-                      f"--- TARGET JD ---\n{jd_content}\n\n"
-                      "Tailor the resume for this specific job. Return TailoredResume JSON."),
+            contents=(
+                "--- ORIGINAL RESUME ---\n"
+                f"<scraped_content>\n{resume_text}\n</scraped_content>\n\n"
+                "--- TARGET JD ---\n"
+                f"<scraped_content>\n{jd_content}\n</scraped_content>\n\n"
+                "Tailor the resume for this specific job. Return TailoredResume JSON."
+            ),
             config=cfg,
         )
         return resp.text
@@ -151,9 +155,13 @@ def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=(f"--- ORIGINAL RESUME ---\n{resume_text}\n\n"
-                      f"--- TARGET JDs ---\n{numbered}\n\n"
-                      "Tailor the resume for each JD. Return BatchTailoredResult JSON."),
+            contents=(
+                "--- ORIGINAL RESUME ---\n"
+                f"<scraped_content>\n{resume_text}\n</scraped_content>\n\n"
+                "--- TARGET JDs ---\n"
+                f"<scraped_content>\n{numbered}\n</scraped_content>\n\n"
+                "Tailor the resume for each JD. Return BatchTailoredResult JSON."
+            ),
             config=cfg,
         )
         result = BatchTailoredResult.model_validate_json(resp.text)
@@ -175,7 +183,11 @@ def batch_re_score(pairs: list[dict]) -> list[dict]:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking batch_re_score()")
     numbered = "\n\n".join(
-        f"[PAIR {i}]\n--- CANDIDATE PROFILE ---\n{p['tailored_resume']}\n\n--- TARGET JD ---\n{p['jd_content']}"
+        f"[PAIR {i}]\n"
+        "--- CANDIDATE PROFILE ---\n"
+        f"<scraped_content>\n{p['tailored_resume']}\n</scraped_content>\n\n"
+        "--- TARGET JD ---\n"
+        f"<scraped_content>\n{p['jd_content']}\n</scraped_content>"
         for i, p in enumerate(pairs)
     )
     cfg = types.GenerateContentConfig(
@@ -219,9 +231,13 @@ def re_score(tailored_resume: str, jd_content: str) -> str:
     try:
         resp = _KEY_POOL.generate_content(
             model=MODEL,
-            contents=(f"--- CANDIDATE PROFILE ---\n{tailored_resume}\n\n"
-                      f"--- TARGET JD ---\n{jd_content}\n\n"
-                      "Provide MatchResult JSON."),
+            contents=(
+                "--- CANDIDATE PROFILE ---\n"
+                f"<scraped_content>\n{tailored_resume}\n</scraped_content>\n\n"
+                "--- TARGET JD ---\n"
+                f"<scraped_content>\n{jd_content}\n</scraped_content>\n\n"
+                "Provide MatchResult JSON."
+            ),
             config=cfg,
         )
         return resp.text
