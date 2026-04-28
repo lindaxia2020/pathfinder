@@ -74,53 +74,106 @@ class TestFinePromptConsistency(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class TestFallbackValueConsistency(unittest.TestCase):
-    """Document and verify fallback/default values across agents."""
+class TestStructuralErrorDropsRecord(unittest.TestCase):
+    """P0-4: structural Gemini errors must drop records, not write fake scores.
 
-    def test_match_evaluate_fallback_score_is_1(self):
-        """match_agent.evaluate_match error fallback must return score=1."""
+    Previously these functions returned score=1 (match_agent) or score=0
+    (resume_optimizer) on any exception, silently polluting Excel. After
+    P0-4 they return None / [] / [{}] sentinels and the orchestrator skips
+    those records. Transient errors (quota, 5xx) bubble up as
+    GeminiTransientError.
+    """
+
+    def test_match_evaluate_returns_none_on_structural(self):
+        from shared.exceptions import GeminiStructuralError
         mock_pool = MagicMock()
-        mock_pool.generate_content.side_effect = RuntimeError("API error")
+        mock_pool.generate_content.side_effect = GeminiStructuralError("bad JSON")
         match_mod._KEY_POOL = mock_pool
         try:
-            result_json = evaluate_match("resume", "jd")
-            result = json.loads(result_json)
-            self.assertEqual(result["compatibility_score"], 1)
+            self.assertIsNone(evaluate_match("resume", "jd"))
         finally:
             match_mod._KEY_POOL = None
 
-    def test_match_batch_coarse_fallback_scores_are_1(self):
-        """match_agent.batch_coarse_score error fallback must return all 1s."""
+    def test_match_batch_coarse_returns_empty_on_structural(self):
+        from shared.exceptions import GeminiStructuralError
         mock_pool = MagicMock()
-        mock_pool.generate_content.side_effect = RuntimeError("API error")
+        mock_pool.generate_content.side_effect = GeminiStructuralError("schema fail")
         match_mod._KEY_POOL = mock_pool
         try:
             scores = batch_coarse_score("resume", [{"jd_json": '{"job_title":"test"}'}] * 3)
-            self.assertEqual(scores, [1, 1, 1])
+            self.assertEqual(scores, [])
         finally:
             match_mod._KEY_POOL = None
 
-    def test_optimizer_batch_re_score_fallback_scores_are_0(self):
-        """resume_optimizer.batch_re_score error fallback returns score=0.
-        This documents the known inconsistency (0 vs 1) flagged by Eval Engineer."""
+    def test_optimizer_batch_re_score_returns_empty_dicts_on_structural(self):
+        from shared.exceptions import GeminiStructuralError
         mock_pool = MagicMock()
-        mock_pool.generate_content.side_effect = RuntimeError("API error")
+        mock_pool.generate_content.side_effect = GeminiStructuralError("schema fail")
         optimizer_mod._KEY_POOL = mock_pool
         try:
             results = batch_re_score([{"tailored_resume": "r", "jd_content": "j"}] * 2)
             for r in results:
-                self.assertEqual(r["compatibility_score"], 0)
+                self.assertEqual(r, {},
+                                 "structural error must yield empty-dict sentinel, "
+                                 "not a fake compatibility_score=0")
         finally:
             optimizer_mod._KEY_POOL = None
 
-    def test_optimizer_re_score_fallback_is_empty_json(self):
-        """resume_optimizer.re_score error fallback returns '{}'."""
+    def test_optimizer_re_score_returns_none_on_structural(self):
+        from shared.exceptions import GeminiStructuralError
         mock_pool = MagicMock()
-        mock_pool.generate_content.side_effect = RuntimeError("API error")
+        mock_pool.generate_content.side_effect = GeminiStructuralError("bad JSON")
         optimizer_mod._KEY_POOL = mock_pool
         try:
-            result = re_score("resume", "jd")
-            self.assertEqual(result, "{}")
+            self.assertIsNone(re_score("resume", "jd"))
+        finally:
+            optimizer_mod._KEY_POOL = None
+
+
+class TestTransientErrorBubblesUp(unittest.TestCase):
+    """P0-4: transient Gemini errors must propagate so the run fails loudly."""
+
+    def test_match_evaluate_reraises_transient(self):
+        from shared.exceptions import GeminiTransientError
+        mock_pool = MagicMock()
+        mock_pool.generate_content.side_effect = GeminiTransientError("429")
+        match_mod._KEY_POOL = mock_pool
+        try:
+            with self.assertRaises(GeminiTransientError):
+                evaluate_match("resume", "jd")
+        finally:
+            match_mod._KEY_POOL = None
+
+    def test_match_batch_coarse_reraises_transient(self):
+        from shared.exceptions import GeminiTransientError
+        mock_pool = MagicMock()
+        mock_pool.generate_content.side_effect = GeminiTransientError("429")
+        match_mod._KEY_POOL = mock_pool
+        try:
+            with self.assertRaises(GeminiTransientError):
+                batch_coarse_score("resume", [{"jd_json": '{}'}])
+        finally:
+            match_mod._KEY_POOL = None
+
+    def test_optimizer_re_score_reraises_transient(self):
+        from shared.exceptions import GeminiTransientError
+        mock_pool = MagicMock()
+        mock_pool.generate_content.side_effect = GeminiTransientError("429")
+        optimizer_mod._KEY_POOL = mock_pool
+        try:
+            with self.assertRaises(GeminiTransientError):
+                re_score("resume", "jd")
+        finally:
+            optimizer_mod._KEY_POOL = None
+
+    def test_optimizer_batch_re_score_reraises_transient(self):
+        from shared.exceptions import GeminiTransientError
+        mock_pool = MagicMock()
+        mock_pool.generate_content.side_effect = GeminiTransientError("429")
+        optimizer_mod._KEY_POOL = mock_pool
+        try:
+            with self.assertRaises(GeminiTransientError):
+                batch_re_score([{"tailored_resume": "r", "jd_content": "j"}])
         finally:
             optimizer_mod._KEY_POOL = None
 

@@ -2,6 +2,34 @@
 import logging
 import threading
 
+from shared.exceptions import GeminiTransientError, GeminiStructuralError
+
+
+# Substrings (case-insensitive) that mark a transient (server / quota) error
+# worth distinguishing from a structural one. Anything else falls through to
+# GeminiStructuralError so the caller drops the record instead of writing a
+# fake fallback score.
+_TRANSIENT_PATTERNS = (
+    "429",
+    "resource_exhausted",
+    "rate limit",
+    "quota",
+    "503",
+    "unavailable",
+    "service_unavailable",
+    "504",
+    "deadline_exceeded",
+    "timeout",
+    "500",
+    "internal_error",
+    "internal server",
+)
+
+
+def _is_transient(err_text: str) -> bool:
+    low = err_text.lower()
+    return any(p in low for p in _TRANSIENT_PATTERNS)
+
 
 class _GeminiKeyPoolBase:
     """Holds multiple Gemini API keys and rotates to the next on quota exhaustion.
@@ -38,7 +66,14 @@ class _GeminiKeyPoolBase:
         return self._clients[key]
 
     def _do_generate(self, model: str, contents, config, genai_mod) -> object:
-        """Core generate_content logic. ``genai_mod`` is the google.genai module."""
+        """Core generate_content logic. ``genai_mod`` is the google.genai module.
+
+        Classifies failures (P0-4):
+          * Quota / 429 → rotate keys; raise GeminiTransientError if all exhausted.
+          * Other transient (5xx, timeout) → raise GeminiTransientError immediately.
+          * Anything else (JSON parse, content filter, schema) → raise
+            GeminiStructuralError so the caller drops the record.
+        """
         tried_count = 0
         while True:
             with self._lock:
@@ -47,15 +82,20 @@ class _GeminiKeyPoolBase:
                 return gc.models.generate_content(model=model, contents=contents, config=config)
             except Exception as e:
                 err = str(e)
+                # Quota-specific path: rotate keys, then bubble up as transient.
                 if "429" in err or "RESOURCE_EXHAUSTED" in err:
                     with self._lock:
                         logging.warning(f"[KeyPool] Key #{self._idx + 1} quota exhausted.")
                         tried_count += 1
                         if not self.rotate() or tried_count >= len(self._keys):
                             logging.error("[KeyPool] All Gemini API keys exhausted.")
-                            raise
-                else:
-                    raise
+                            raise GeminiTransientError(f"All Gemini keys quota exhausted: {err}") from e
+                    continue
+                # Other transient errors: don't rotate (not key-specific), fail loudly.
+                if _is_transient(err):
+                    raise GeminiTransientError(err) from e
+                # Everything else is structural — caller should drop the record.
+                raise GeminiStructuralError(err) from e
 
     def generate_content(self, model, contents, config):
         """BUG-31: unified generate_content using stored genai module."""

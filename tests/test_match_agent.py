@@ -428,11 +428,21 @@ class TestBatchCoarseScore(unittest.TestCase):
         self.assertEqual(scores[0], 85)
         self.assertEqual(scores[1], 30)
 
-    def test_returns_ones_on_exception(self):
-        match_agent_mod._KEY_POOL.generate_content.side_effect = Exception("API down")
+    def test_returns_empty_on_structural_error(self):
+        """P0-4: structural error returns [] sentinel, never fake [1]*N."""
+        from shared.exceptions import GeminiStructuralError
+        match_agent_mod._KEY_POOL.generate_content.side_effect = GeminiStructuralError("bad")
         jds = [{"url": "https://x.com", "jd_json": "{}"}]
         scores = batch_coarse_score("resume", jds)
-        self.assertEqual(scores, [1])
+        self.assertEqual(scores, [])
+
+    def test_reraises_transient_error(self):
+        """P0-4: transient errors must bubble up so main fails loudly."""
+        from shared.exceptions import GeminiTransientError
+        match_agent_mod._KEY_POOL.generate_content.side_effect = GeminiTransientError("429")
+        jds = [{"url": "https://x.com", "jd_json": "{}"}]
+        with self.assertRaises(GeminiTransientError):
+            batch_coarse_score("resume", jds)
 
     def test_handles_out_of_range_index(self):
         """Gemini returns index beyond batch size — should ignore it."""
@@ -468,11 +478,19 @@ class TestEvaluateMatch(unittest.TestCase):
         self.assertIn("compatibility_score", data)
         self.assertEqual(data["compatibility_score"], 72)
 
-    def test_returns_minimum_score_on_exception(self):
-        match_agent_mod._KEY_POOL.generate_content.side_effect = Exception("fail")
+    def test_returns_none_on_structural_error(self):
+        """P0-4: structural error returns None sentinel, never fake score=1 JSON."""
+        from shared.exceptions import GeminiStructuralError
+        match_agent_mod._KEY_POOL.generate_content.side_effect = GeminiStructuralError("bad")
         result = evaluate_match("resume", '{}')
-        data = json.loads(result)
-        self.assertEqual(data["compatibility_score"], 1)
+        self.assertIsNone(result)
+
+    def test_reraises_transient_error(self):
+        """P0-4: transient errors propagate."""
+        from shared.exceptions import GeminiTransientError
+        match_agent_mod._KEY_POOL.generate_content.side_effect = GeminiTransientError("503")
+        with self.assertRaises(GeminiTransientError):
+            evaluate_match("resume", '{}')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
