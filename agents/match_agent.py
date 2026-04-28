@@ -70,37 +70,6 @@ _GeminiKeyPool = _GeminiKeyPoolBase  # alias for backward compat (tests)
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
 
-_KEYWORD_THRESHOLD = 4
-
-# ── Keyword pre-filter (AI-specific terms only) ───────────────────────────────
-_AI_TECH_TERMS = frozenset({
-    "llm", "gpt", "genai", "transformer", "pytorch", "tensorflow",
-    "cuda", "gpu", "inference", "training", "mlops", "neural",
-    "foundation", "agent", "diffusion", "multimodal", "embedding", "rlhf",
-    "finetuning", "huggingface", "langchain", "openai", "anthropic", "gemini",
-    "retrieval", "rag", "vector", "tokenizer", "attention",
-})
-
-
-def _quick_keyword_score(resume_text: str, jd_json: str) -> int:
-    """Count shared AI-specific terms between resume and JD.
-    Returns 999 on parse error (don't filter). Threshold: < _KEYWORD_THRESHOLD → skip Gemini."""
-    try:
-        d = json.loads(jd_json)
-        jd_text = " ".join([
-            d.get("job_title", ""),
-            " ".join(d.get("requirements", [])),
-            " ".join(d.get("additional_qualifications", [])),
-            " ".join(d.get("key_responsibilities", [])),
-            " ".join(d.get("core_ai_tech_stack", [])),
-        ]).lower()
-    except Exception:
-        return 999
-    resume_words = set(re.findall(r'\b\w+\b', resume_text.lower()))
-    jd_words     = set(re.findall(r'\b\w+\b', jd_text))
-    return len(_AI_TECH_TERMS & resume_words & jd_words)
-
-
 PROFILE_DIR = os.getenv("PROFILE_DIR", os.path.join(PROJECT_ROOT, "profile"))
 
 
@@ -311,7 +280,8 @@ async def _main_inner(summary: RunSummary):
         summary.note("No JDs in tracker")
         return
 
-    # ── Stage 1: pre-filter + batch coarse scoring ────────────────────────────
+    # ── Stage 1: batch coarse scoring ─────────────────────────────────────────
+    # Trust job_agent's `is_ai_tpm` classification — no second-pass keyword filter.
     existing_pairs = get_match_pairs(xlsx_path)
 
     # Detect stale pairs (resume changed since last score)
@@ -327,41 +297,24 @@ async def _main_inner(summary: RunSummary):
     already_coarse = {k for k, v in existing_pairs.items()
                       if k[0] == resume_id and v["stage"] == "coarse" and k not in stale_keys}
 
-    pre_pass, pre_fail = [], []
-    for jd in jds:
-        key = (resume_id, jd["url"])
-        if key in already_fine or key in already_coarse:
-            continue
-        qs = _quick_keyword_score(resume_text, jd["jd_json"])
-        (pre_pass if qs >= _KEYWORD_THRESHOLD else pre_fail).append((jd, qs))
+    pending_jds = [
+        jd for jd in jds
+        if (resume_id, jd["url"]) not in already_fine
+        and (resume_id, jd["url"]) not in already_coarse
+    ]
 
     print(f"📋 JDs in tracker (AI-TPM): {len(jds)}")
     print(f"✅ Already fine-scored:      {len(already_fine)}")
     print(f"~  Already coarse-scored:   {len(already_coarse)}")
-    print(f"🚫 Pre-filtered (keyword):   {len(pre_fail)}")
-    print(f"🔍 Needs coarse scoring:     {len(pre_pass)}\n")
+    print(f"🔍 Needs coarse scoring:     {len(pending_jds)}\n")
     summary.skipped += len(already_fine) + len(already_coarse)
-    summary.attempted += len(pre_pass) + len(pre_fail)
-
-    # Write pre-filter failures as score=0
-    if pre_fail:
-        pf_records = [
-            (resume_id, jd["url"], json.dumps({
-                "compatibility_score": 0,
-                "key_strengths": [],
-                "critical_gaps": ["Too few shared AI/tech terms with resume."],
-                "recommendation_reason": f"Pre-filter: keyword_overlap={qs} < {_KEYWORD_THRESHOLD}.",
-            }), resume_hash, "coarse")
-            for jd, qs in pre_fail
-        ]
-        batch_upsert_match_records(xlsx_path, pf_records)
-        logging.info(f"[Stage1] Wrote {len(pf_records)} pre-filter records.")
+    summary.attempted += len(pending_jds)
 
     # Batch coarse scoring in groups of 10
     coarse_scores: dict[str, int] = {}
-    if pre_pass:
+    if pending_jds:
         limiter    = _GEMINI_LIMITER
-        pass_jds   = [jd for jd, _ in pre_pass]
+        pass_jds   = pending_jds
         n_batches  = math.ceil(len(pass_jds) / 10)
 
         for b in range(n_batches):

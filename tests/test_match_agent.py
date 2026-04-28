@@ -2,7 +2,6 @@
 Tests for agents/match_agent.py
 
 Coverage:
-  - _quick_keyword_score: keyword overlap counting
   - _RateLimiter: rate limiter interval enforcement
   - load_resume: reads .md/.txt from folder
   - _GeminiKeyPool: key rotation on 429
@@ -37,74 +36,31 @@ google.genai.types = MagicMock()
 from shared.prompts import COARSE_SYSTEM_PROMPT as _COARSE_SYSTEM_PROMPT
 from shared.schemas import CoarseItem, BatchCoarseResult, MatchResult
 from agents.match_agent import (
-    _quick_keyword_score,
     _RateLimiter,
     load_resume,
     _load_jd_markdown,
     _GeminiKeyPool,
     batch_coarse_score,
     evaluate_match,
-    _AI_TECH_TERMS,
-    _KEYWORD_THRESHOLD,
 )
 import agents.match_agent as match_agent_mod
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class TestQuickKeywordScore(unittest.TestCase):
+class TestNoKeywordPreFilter(unittest.TestCase):
+    """Regression for 2026-04-28: the keyword pre-filter (_quick_keyword_score
+    + _AI_TECH_TERMS + _KEYWORD_THRESHOLD) was removed because it second-guessed
+    job_agent's `is_ai_tpm` classification with crude regex and produced false
+    negatives on AI-native JDs that didn't repeat magic words. Stage 1 batch
+    coarse scoring is the first quantitative gate; Stage 2 fine handles top-N."""
 
-    def _jd(self, **kwargs):
-        base = {
-            "job_title": "AI TPM",
-            "core_ai_tech_stack": [],
-            "key_responsibilities": [],
-        }
-        base.update(kwargs)
-        return json.dumps(base)
-
-    def test_high_overlap(self):
-        """Resume and JD sharing many AI terms should score high."""
-        resume = "I have experience with llm gpt transformer pytorch cuda gpu inference rlhf embedding"
-        jd_json = self._jd(
-            core_ai_tech_stack=["llm", "gpt", "transformer"],
-            key_responsibilities=["cuda", "gpu", "inference"],
-        )
-        score = _quick_keyword_score(resume, jd_json)
-        self.assertGreaterEqual(score, 5)
-
-    def test_zero_overlap(self):
-        resume = "I am a marketing manager with five years of brand experience."
-        jd_json = self._jd(
-            core_ai_tech_stack=["llm", "pytorch"],
-            key_responsibilities=["gpu inference"],
-        )
-        score = _quick_keyword_score(resume, jd_json)
-        self.assertEqual(score, 0)
-
-    def test_invalid_json_returns_999(self):
-        score = _quick_keyword_score("anything", "NOT JSON AT ALL")
-        self.assertEqual(score, 999)
-
-    def test_empty_resume(self):
-        jd_json = self._jd(core_ai_tech_stack=["llm", "gpu"])
-        score = _quick_keyword_score("", jd_json)
-        self.assertEqual(score, 0)
-
-    def test_case_insensitive(self):
-        """AI terms are lowercased before matching."""
-        resume = "LLM GPU PYTORCH"
-        jd_json = self._jd(core_ai_tech_stack=["LLM", "GPU"])
-        score = _quick_keyword_score(resume, jd_json)
-        self.assertGreater(score, 0)
-
-    def test_threshold_boundary(self):
-        """At least _KEYWORD_THRESHOLD matching terms should pass."""
-        terms = list(_AI_TECH_TERMS)[:_KEYWORD_THRESHOLD]
-        resume = " ".join(terms)
-        jd_json = self._jd(core_ai_tech_stack=terms[:2],
-                           key_responsibilities=terms[2:])
-        score = _quick_keyword_score(resume, jd_json)
-        self.assertGreaterEqual(score, _KEYWORD_THRESHOLD)
+    def test_module_does_not_export_prefilter_symbols(self):
+        for sym in ("_quick_keyword_score", "_AI_TECH_TERMS", "_KEYWORD_THRESHOLD"):
+            self.assertFalse(
+                hasattr(match_agent_mod, sym),
+                f"match_agent.{sym} should be removed; reintroducing the keyword "
+                f"pre-filter requires re-justifying it (see 2026-04-28 review)."
+            )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
