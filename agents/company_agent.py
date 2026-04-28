@@ -46,6 +46,7 @@ from shared.excel_store import (
 )
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.config import MODEL
+from shared.run_summary import RunSummary
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - %(message)s')
@@ -595,65 +596,87 @@ def run_phase_1_5(xlsx_path: str):
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     global _KEY_POOL
-    tavily_key  = os.getenv("TAVILY_API_KEY")
-    gemini_keys = [k for k in [
-        os.getenv("GEMINI_API_KEY"),
-        os.getenv("GEMINI_API_KEY_2"),
-    ] if k]
-    missing = []
-    if not gemini_keys:
-        missing.append("GEMINI_API_KEY")
-    if not tavily_key:
-        missing.append("TAVILY_API_KEY")
-    if missing:
-        print(f"❌ Missing env vars: {missing}")
-        return
+    summary = RunSummary(agent="company")
+    try:
+        tavily_key  = os.getenv("TAVILY_API_KEY")
+        gemini_keys = [k for k in [
+            os.getenv("GEMINI_API_KEY"),
+            os.getenv("GEMINI_API_KEY_2"),
+        ] if k]
+        missing = []
+        if not gemini_keys:
+            missing.append("GEMINI_API_KEY")
+        if not tavily_key:
+            missing.append("TAVILY_API_KEY")
+        if missing:
+            print(f"❌ Missing env vars: {missing}")
+            summary.note(f"Missing env vars: {missing}")
+            return
 
-    _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
-    logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
+        _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
+        logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
 
-    print("\n" + "="*60)
-    print("COMPANY AGENT")
-    print("="*60 + "\n")
+        print("\n" + "="*60)
+        print("COMPANY AGENT")
+        print("="*60 + "\n")
 
-    xlsx_path = get_or_create_excel()
-    print(f"📊 Dashboard: {xlsx_path}")
+        xlsx_path = get_or_create_excel()
+        print(f"📊 Dashboard: {xlsx_path}")
 
-    # ── Step 1: Read existing companies (both lists) ──────────────────────────
-    current_count     = count_company_rows(xlsx_path)
-    existing_rows     = get_company_rows(xlsx_path)
-    names_main        = {str(r[0]).strip() for r in existing_rows if r[0]}
-    names_without_tpm = get_company_names_without_tpm(xlsx_path)
-    existing_names    = names_main | names_without_tpm
-    print(f"📋 Existing companies in Company_List: {current_count}")
-    print(f"📋 Companies in Company_Without_TPM: {len(names_without_tpm)}")
-    print(f"📋 Total known companies (dedup exclusion list): {len(existing_names)}")
+        # ── Step 1: Read existing companies (both lists) ──────────────────────────
+        current_count     = count_company_rows(xlsx_path)
+        existing_rows     = get_company_rows(xlsx_path)
+        names_main        = {str(r[0]).strip() for r in existing_rows if r[0]}
+        names_without_tpm = get_company_names_without_tpm(xlsx_path)
+        existing_names    = names_main | names_without_tpm
+        print(f"📋 Existing companies in Company_List: {current_count}")
+        print(f"📋 Companies in Company_Without_TPM: {len(names_without_tpm)}")
+        print(f"📋 Total known companies (dedup exclusion list): {len(existing_names)}")
 
-    # ── Step 2: Determine how many to fetch ───────────────────────────────────
-    if current_count >= MAX_TOTAL:
-        print(f"✅ Already at max capacity ({MAX_TOTAL} companies). Skipping discovery.")
-    else:
-        slots_left = MAX_TOTAL - current_count
-        need       = min(BATCH_SIZE, slots_left)
-        print(f"🔍 Will discover up to {need} new companies "
-              f"(cap: {MAX_TOTAL}, current: {current_count})...")
-
-        companies = discover_ai_companies(tavily_key, existing_names, need)
-
-        if companies:
-            companies = companies[:need]
-            data = [c.model_dump() if hasattr(c, "model_dump") else dict(c)
-                    for c in companies]
-            upsert_companies(xlsx_path, data)
-            new_count = count_company_rows(xlsx_path)
-            print(f"✅ Added {len(data)} companies. Total: {new_count}")
+        # ── Step 2: Determine how many to fetch ───────────────────────────────────
+        if current_count >= MAX_TOTAL:
+            print(f"✅ Already at max capacity ({MAX_TOTAL} companies). Skipping discovery.")
+            summary.note(f"At capacity ({MAX_TOTAL}); discovery skipped.")
         else:
-            print("⚠️  No new companies returned.")
+            slots_left = MAX_TOTAL - current_count
+            need       = min(BATCH_SIZE, slots_left)
+            print(f"🔍 Will discover up to {need} new companies "
+                  f"(cap: {MAX_TOTAL}, current: {current_count})...")
+            summary.attempted = need
 
-    # ── Step 3: Phase 1.5 — upgrade ATS URLs ─────────────────────────────────
-    run_phase_1_5(xlsx_path)
+            companies = discover_ai_companies(tavily_key, existing_names, need)
 
-    print("🎉 Company Agent complete.")
+            if companies:
+                companies = companies[:need]
+                data = [c.model_dump() if hasattr(c, "model_dump") else dict(c)
+                        for c in companies]
+                upsert_companies(xlsx_path, data)
+                new_count = count_company_rows(xlsx_path)
+                print(f"✅ Added {len(data)} companies. Total: {new_count}")
+                summary.succeeded = len(data)
+                summary.failed = max(0, need - len(data))
+            else:
+                print("⚠️  No new companies returned.")
+                summary.failed = need
+
+        # ── Step 3: Phase 1.5 — upgrade ATS URLs ─────────────────────────────────
+        run_phase_1_5(xlsx_path)
+
+        print("🎉 Company Agent complete.")
+    except Exception as e:
+        # P0-7: capture pre-finally so summary reflects the failure mode.
+        from shared.exceptions import GeminiTransientError
+        if isinstance(e, GeminiTransientError):
+            summary.transient_errors += 1
+            summary.note(f"Run aborted (transient): {e}")
+        else:
+            summary.note(f"Run aborted: {type(e).__name__}: {e}")
+        raise
+    finally:
+        summary.mark_finished()
+        log_path = summary.write()
+        print(f"📊 Run summary: {log_path}")
+        print(summary.to_json())
 
 
 if __name__ == "__main__":

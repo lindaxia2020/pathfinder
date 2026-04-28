@@ -58,6 +58,7 @@ from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
+from shared.run_summary import RunSummary
 
 # BUG-41: single shared limiter across Stage 1 and Stage 2
 _GEMINI_LIMITER = _RateLimiter(rpm=13)
@@ -236,12 +237,32 @@ def evaluate_match(resume_text: str, jd_json: str) -> str | None:
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     global _KEY_POOL
+    summary = RunSummary(agent="match")
+    try:
+        await _main_inner(summary)
+    except GeminiTransientError as e:
+        summary.transient_errors += 1
+        summary.note(f"Run aborted (transient): {e}")
+        raise
+    except Exception as e:
+        summary.note(f"Run aborted: {type(e).__name__}: {e}")
+        raise
+    finally:
+        summary.mark_finished()
+        log_path = summary.write()
+        print(f"📊 Run summary: {log_path}")
+        print(summary.to_json())
+
+
+async def _main_inner(summary: RunSummary):
+    global _KEY_POOL
     gemini_keys = [k for k in [
         os.getenv("GEMINI_API_KEY"),
         os.getenv("GEMINI_API_KEY_2"),
     ] if k]
     if not gemini_keys:
         print("❌ Missing GEMINI_API_KEY in .env")
+        summary.note("Missing GEMINI_API_KEY")
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
@@ -254,6 +275,7 @@ async def main():
     if not resume_text:
         print(f"⚠️  No resume found in {PROFILE_DIR}\n"
               f"   Create {PROFILE_DIR}/ and add a .md or .txt resume file.")
+        summary.note(f"No resume in {PROFILE_DIR}")
         return
 
     resume_hash = hashlib.md5(resume_text.encode("utf-8")).hexdigest()
@@ -263,6 +285,7 @@ async def main():
     jds       = get_jd_rows_for_match(xlsx_path)
     if not jds:
         print("⚠️  No AI-TPM JDs in tracker. Run job_agent.py first.")
+        summary.note("No JDs in tracker")
         return
 
     # ── Stage 1: pre-filter + batch coarse scoring ────────────────────────────
@@ -294,6 +317,8 @@ async def main():
     print(f"~  Already coarse-scored:   {len(already_coarse)}")
     print(f"🚫 Pre-filtered (keyword):   {len(pre_fail)}")
     print(f"🔍 Needs coarse scoring:     {len(pre_pass)}\n")
+    summary.skipped += len(already_fine) + len(already_coarse)
+    summary.attempted += len(pre_pass) + len(pre_fail)
 
     # Write pre-filter failures as score=0
     if pre_fail:
@@ -327,10 +352,13 @@ async def main():
                     f"[Stage1] Batch {b+1} returned no scores (structural error); "
                     f"skipping {len(batch)} JD(s)."
                 )
+                summary.structural_errors += 1
+                summary.failed += len(batch)
                 continue
             for jd, score in zip(batch, scores):
                 coarse_scores[jd["url"]] = score
             logging.info(f"[Stage1] Batch {b+1} scores: {scores}")
+        summary.succeeded += len(coarse_scores)
 
         # Only write records for JDs that received a real score.
         coarse_records = [
@@ -397,6 +425,8 @@ async def main():
                 # P0-4: structural error — drop the record, keep coarse score in Excel.
                 if result_json is None:
                     print(f"    Structural error; record dropped (coarse score kept).")
+                    summary.structural_errors += 1
+                    summary.failed += 1
                     return
                 try:
                     parsed = json.loads(result_json)
@@ -408,10 +438,14 @@ async def main():
                     # JSON parse on Gemini response with response_schema set is
                     # essentially never structural — but if it does happen, drop.
                     logging.error(f"[Fine] Response parse failed for {url}: {e}")
+                    summary.structural_errors += 1
+                    summary.failed += 1
                     return
                 fine_records.append((resume_id, url, result_json, resume_hash, "fine"))
+                summary.succeeded += 1
                 print(f"    Score: {score}/100")
 
+        summary.attempted += len(to_fine)
         await asyncio.gather(*[fine_one(k, i) for i, k in enumerate(to_fine, 1)])
         batch_upsert_match_records(xlsx_path, fine_records)
         logging.info(f"[Stage2] Wrote {len(fine_records)} fine records.")

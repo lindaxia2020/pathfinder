@@ -595,16 +595,20 @@ class TestBug41SharedRateLimiter(unittest.TestCase):
     def test_no_local_limiter_creation_in_main(self):
         """main() should not create new _RateLimiter instances."""
         import inspect
-        from agents.match_agent import main
-        source = inspect.getsource(main)
+        # P0-7: main() is now a thin RunSummary wrapper; the orchestration
+        # body lives in _main_inner.
+        from agents.match_agent import _main_inner
+        source = inspect.getsource(_main_inner)
         self.assertNotIn("_RateLimiter(", source,
                          "main() must not create new _RateLimiter instances")
 
     def test_limiter_used_is_module_level(self):
         """Both stages should reference _GEMINI_LIMITER, not a local instance."""
         import inspect
-        from agents.match_agent import main
-        source = inspect.getsource(main)
+        # P0-7: main() is now a thin RunSummary wrapper; the orchestration
+        # body lives in _main_inner.
+        from agents.match_agent import _main_inner
+        source = inspect.getsource(_main_inner)
         self.assertIn("_GEMINI_LIMITER", source,
                       "main() must use the module-level _GEMINI_LIMITER")
 
