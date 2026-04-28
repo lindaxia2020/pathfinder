@@ -206,6 +206,15 @@ def get_company_rows_with_row_num(xlsx_path: str = EXCEL_PATH) -> list[tuple[int
 
 
 def upsert_companies(xlsx_path: str, companies_data: list):
+    """Upsert companies into Company_List.
+
+    For NEW companies: write all 9 columns with TPM counts initialized to
+    [0, 0, 0, "No"].
+    For EXISTING companies: only update cols 1–5 (Name, AIDomain, Focus,
+    Career URL, Updated At). Cols 6–9 (TPM Jobs, AI TPM Jobs, No TPM Count,
+    Auto Archived) are preserved — they are managed exclusively by
+    update_company_job_counts and the auto-archival pipeline.
+    """
     wb = load_workbook(xlsx_path)
     try:
         ws  = wb["Company_List"]
@@ -213,13 +222,13 @@ def upsert_companies(xlsx_path: str, companies_data: list):
         now  = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         for c in companies_data:
             name = c.get("company_name", "N/A")
-            row  = [name, c.get("ai_domain", "N/A"), c.get("business_focus", "N/A"),
-                    c.get("career_url", "N/A"), now, 0, 0, 0, "No"]
+            cols_1_to_5 = [name, c.get("ai_domain", "N/A"), c.get("business_focus", "N/A"),
+                           c.get("career_url", "N/A"), now]
             if name in idx:
-                for col, val in enumerate(row, 1):
+                for col, val in enumerate(cols_1_to_5, 1):
                     ws.cell(idx[name], col, val)
             else:
-                ws.append(row)
+                ws.append(cols_1_to_5 + [0, 0, 0, "No"])
                 idx[name] = ws.max_row
         wb.save(xlsx_path)
     finally:

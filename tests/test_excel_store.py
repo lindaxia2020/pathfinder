@@ -212,6 +212,97 @@ class TestUpsertCompanies(unittest.TestCase):
         self.assertEqual(rows[0][3], "N/A")
 
 
+class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
+    """P0-5: upsert_companies must NOT reset cols 6-9 (TPM Jobs / AI TPM Jobs /
+    No TPM Count / Auto Archived) on existing rows. Those columns are managed
+    by update_company_job_counts and the auto-archival pipeline; resetting
+    them on upsert silently destroys data when the pipeline crashes between
+    company discovery and JD scraping."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _seed_company_with_counts(self, name: str, tpm: int, ai_tpm: int,
+                                  no_tpm: int, auto_archived: str):
+        upsert_companies(self.path, [{
+            "company_name": name, "ai_domain": "NLP",
+            "business_focus": "X", "career_url": "https://example.com/jobs"
+        }])
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        # Find the row by name
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value == name:
+                ws.cell(r, 6).value = tpm
+                ws.cell(r, 7).value = ai_tpm
+                ws.cell(r, 8).value = no_tpm
+                ws.cell(r, 9).value = auto_archived
+                break
+        wb.save(self.path)
+        wb.close()
+
+    def _read_row(self, name: str):
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        try:
+            for r in range(2, ws.max_row + 1):
+                if ws.cell(r, 1).value == name:
+                    return [ws.cell(r, c).value for c in range(1, 10)]
+            return None
+        finally:
+            wb.close()
+
+    def test_existing_row_preserves_tpm_counts(self):
+        self._seed_company_with_counts("Acme", tpm=5, ai_tpm=2,
+                                       no_tpm=1, auto_archived="Yes")
+        # Re-upsert with NEW career_url
+        upsert_companies(self.path, [{
+            "company_name": "Acme", "ai_domain": "NLP",
+            "business_focus": "X", "career_url": "https://acme.io/careers"
+        }])
+        row = self._read_row("Acme")
+        self.assertEqual(row[3], "https://acme.io/careers", "career_url should update")
+        self.assertEqual(row[5], 5, "TPM Jobs must be preserved")
+        self.assertEqual(row[6], 2, "AI TPM Jobs must be preserved")
+        self.assertEqual(row[7], 1, "No TPM Count must be preserved")
+        self.assertEqual(row[8], "Yes", "Auto Archived must be preserved")
+
+    def test_new_row_initializes_counts_to_zero(self):
+        upsert_companies(self.path, [{
+            "company_name": "NewCo", "ai_domain": "NLP",
+            "business_focus": "X", "career_url": "https://newco.com"
+        }])
+        row = self._read_row("NewCo")
+        self.assertEqual(row[5], 0)
+        self.assertEqual(row[6], 0)
+        self.assertEqual(row[7], 0)
+        self.assertEqual(row[8], "No")
+
+    def test_existing_row_updates_cols_1_to_5(self):
+        self._seed_company_with_counts("MutCo", tpm=9, ai_tpm=3,
+                                       no_tpm=0, auto_archived="No")
+        upsert_companies(self.path, [{
+            "company_name": "MutCo", "ai_domain": "Robotics",
+            "business_focus": "Updated focus",
+            "career_url": "https://mutco.io/jobs"
+        }])
+        row = self._read_row("MutCo")
+        self.assertEqual(row[1], "Robotics")
+        self.assertEqual(row[2], "Updated focus")
+        self.assertEqual(row[3], "https://mutco.io/jobs")
+        # Updated At (col 5, index 4) should be a non-empty string
+        self.assertIsNotNone(row[4])
+        self.assertNotEqual(row[4], "")
+        # Counts preserved
+        self.assertEqual(row[5], 9)
+        self.assertEqual(row[6], 3)
+
+
 class TestGetCompanyNamesWithoutTPM(unittest.TestCase):
 
     def setUp(self):
