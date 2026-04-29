@@ -42,6 +42,7 @@ from agents.match_agent import (
     _GeminiKeyPool,
     batch_coarse_score,
     evaluate_match,
+    _select_fine_candidates,
 )
 import agents.match_agent as match_agent_mod
 
@@ -717,6 +718,88 @@ class TestBug31NoSubclassNeeded(unittest.TestCase):
         pool = _GeminiKeyPoolBase(["key1"], genai_mod=mock_genai)
         result = pool.generate_content("model", "content", MagicMock())
         mock_genai.Client.assert_called_with(api_key="key1")
+
+
+class TestSelectFineCandidates(unittest.TestCase):
+    """Stage 2 fine-eval gate: union of (score >= threshold) OR (top P%)."""
+
+    @staticmethod
+    def _scored(scores_by_url: dict, stage: str = "coarse") -> dict:
+        """Build the scored_for_resume shape: {(rid, url): {score, stage, ...}}."""
+        return {
+            ("r1", url): {"score": s, "stage": stage, "hash": "x"}
+            for url, s in scores_by_url.items()
+        }
+
+    def test_flat_high_threshold_dominates(self):
+        """All scores well above threshold → union should select every JD."""
+        scored = self._scored({f"u{i}": 75 for i in range(5)})
+        to_fine, stats = _select_fine_candidates(scored, score_threshold=60, top_percent=60)
+        self.assertEqual(len(to_fine), 5, "threshold should pull in all 5")
+        self.assertEqual(stats["threshold_count"], 5)
+        self.assertEqual(stats["top_count"], 3)  # ceil(5*0.6) = 3
+
+    def test_flat_low_top_percent_dominates(self):
+        """All scores below threshold → only top P% qualifies."""
+        scored = self._scored({f"u{i}": 40 for i in range(10)})
+        to_fine, stats = _select_fine_candidates(scored, score_threshold=60, top_percent=60)
+        self.assertEqual(stats["threshold_count"], 0)
+        self.assertEqual(stats["top_count"], 6)  # ceil(10*0.6) = 6
+        self.assertEqual(len(to_fine), 6)
+
+    def test_mixed_true_union(self):
+        """High scorer below top-P% rank still gets in via threshold; vice versa."""
+        # 10 JDs. top-60% = top 6 by rank. threshold=60 catches 5 high scorers.
+        # Construct so the sets overlap but each adds something the other lacks.
+        scored = self._scored({
+            "u0": 90, "u1": 85, "u2": 75, "u3": 70, "u4": 65,  # all >=60 (5 above thr)
+            "u5": 55, "u6": 50, "u7": 45, "u8": 40, "u9": 35,  # below thr
+        })
+        to_fine, stats = _select_fine_candidates(scored, score_threshold=60, top_percent=60)
+        self.assertEqual(stats["threshold_count"], 5)
+        self.assertEqual(stats["top_count"], 6)  # ceil(10*0.6)
+        # Union = top 6 (u0..u5) ∪ {u0..u4} = u0..u5 → 6 JDs
+        urls = {url for (_, url) in to_fine}
+        self.assertEqual(urls, {"u0", "u1", "u2", "u3", "u4", "u5"})
+
+    def test_threshold_pulls_in_below_top_rank(self):
+        """A JD scoring >= threshold but ranked outside top-P% is still selected."""
+        # 100 JDs. top-60% = top 60. JDs ranked 61..100 with score >= 60 should
+        # still get picked up by the threshold leg.
+        scored = self._scored({f"u{i:03d}": 60 for i in range(100)})
+        # All tied at 60 — top-60% is arbitrary; threshold catches all 100.
+        to_fine, stats = _select_fine_candidates(scored, score_threshold=60, top_percent=60)
+        self.assertEqual(stats["threshold_count"], 100)
+        self.assertEqual(len(to_fine), 100, "threshold leg should rescue tied-at-60 JDs")
+
+    def test_skips_already_fine(self):
+        """Pairs already at stage='fine' are excluded from the queue."""
+        scored = {
+            ("r1", "u0"): {"score": 80, "stage": "fine"},
+            ("r1", "u1"): {"score": 80, "stage": "coarse"},
+        }
+        to_fine, _ = _select_fine_candidates(scored, score_threshold=60, top_percent=60)
+        self.assertEqual([k[1] for k in to_fine], ["u1"])
+
+    def test_empty_input(self):
+        to_fine, stats = _select_fine_candidates({}, score_threshold=60, top_percent=60)
+        self.assertEqual(to_fine, [])
+        self.assertEqual(stats["n"], 0)
+
+    def test_single_jd_top_n_min_one(self):
+        """top_n must be at least 1 even with N=1 and small percent."""
+        scored = self._scored({"u0": 30})
+        to_fine, stats = _select_fine_candidates(scored, score_threshold=60, top_percent=10)
+        self.assertEqual(stats["top_count"], 1)
+        self.assertEqual(len(to_fine), 1)
+
+    def test_threshold_override_narrows(self):
+        """Higher threshold shrinks the threshold leg."""
+        scored = self._scored({"u0": 85, "u1": 70, "u2": 65, "u3": 55, "u4": 40})
+        _, stats_low = _select_fine_candidates(scored, score_threshold=60, top_percent=60)
+        _, stats_hi  = _select_fine_candidates(scored, score_threshold=80, top_percent=60)
+        self.assertEqual(stats_low["threshold_count"], 3)
+        self.assertEqual(stats_hi["threshold_count"], 1)
 
 
 if __name__ == "__main__":
