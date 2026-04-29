@@ -8,7 +8,7 @@ drop it" — the orchestrator does not write a fake score in its place.
 import sys
 import os
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, PROJECT_ROOT)
@@ -89,18 +89,25 @@ class TestPoolClassifiesTransient(unittest.TestCase):
         # Should have tried at least both keys before giving up.
         self.assertGreaterEqual(client.models.generate_content.call_count, 2)
 
-    def test_503_raises_transient_no_rotation(self):
+    def test_503_retries_with_backoff_then_raises_transient(self):
+        # Server-side 5xx is not key-specific, so the pool must NOT rotate keys.
+        # It does retry on the same key with bounded backoff before raising.
+        from shared.gemini_pool import _TRANSIENT_RETRY_BACKOFFS
         pool, client = self._build_pool_with_failing_sdk(
             Exception("503 Service Unavailable"))
-        with self.assertRaises(GeminiTransientError):
-            pool.generate_content(model="m", contents="c", config=None)
-        # 5xx is not key-specific, so no retry-rotation.
-        self.assertEqual(client.models.generate_content.call_count, 1)
+        with patch("shared.gemini_pool.time.sleep"):
+            with self.assertRaises(GeminiTransientError):
+                pool.generate_content(model="m", contents="c", config=None)
+        self.assertEqual(
+            client.models.generate_content.call_count,
+            1 + len(_TRANSIENT_RETRY_BACKOFFS),
+        )
 
     def test_deadline_exceeded_raises_transient(self):
         pool, _ = self._build_pool_with_failing_sdk(Exception("DEADLINE_EXCEEDED on request"))
-        with self.assertRaises(GeminiTransientError):
-            pool.generate_content(model="m", contents="c", config=None)
+        with patch("shared.gemini_pool.time.sleep"):
+            with self.assertRaises(GeminiTransientError):
+                pool.generate_content(model="m", contents="c", config=None)
 
 
 class TestPoolClassifiesStructural(unittest.TestCase):
