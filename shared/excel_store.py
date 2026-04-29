@@ -768,8 +768,30 @@ def upsert_match_record(xlsx_path: str, resume_id: str, jd_url: str, match_json:
 def batch_upsert_match_records(xlsx_path: str, records: list) -> int:
     """
     Write multiple match records in a single load→modify→save cycle.
-    records: list of (resume_id, jd_url, match_json, resume_hash, stage) tuples.
-    Returns the number of records written.
+
+    Accepts two record shapes (interchangeable within a single call):
+
+      Legacy 5-tuple (back-compat):
+          (resume_id, jd_url, match_json, resume_hash, stage)
+          Writes the 9 legacy columns; new 3-dim columns left untouched.
+
+      Dict (PRJ-002 PR 3+):
+          {
+            "resume_id": str, "jd_url": str, "match_json": str,
+            "resume_hash": str, "stage": str,
+            # all of the following are OPTIONAL — keys absent from the dict
+            # leave the corresponding Excel column unchanged so Stage 1 / Stage 2
+            # writes can update only their own dimension:
+            "ats_coverage_percent": float | None,    # written if KEY PRESENT
+            "ats_missing":          list[str],       # joined ', ', top 5
+            "recruiter_score":      int | None,
+            "hm_score":             int | None,
+          }
+
+    "Key absent" semantics matter for Stage 2: it writes a fine record
+    that updates HM Score, Strengths, Gaps, Reason, and Stage="fine" — but
+    must NOT clobber the ATS Coverage % / Recruiter Score / ATS Missing
+    that Stage 1 already wrote.
     """
     if not records:
         return 0
@@ -783,7 +805,24 @@ def batch_upsert_match_records(xlsx_path: str, records: list) -> int:
             url = ws.cell(r, 2).value
             if rid and url:
                 idx[(str(rid), str(url))] = r
-        for resume_id, jd_url, match_json, resume_hash, stage in records:
+        # Resolve dynamic column positions for new dim columns. They may not
+        # exist yet on a freshly migrated file from before the PRJ-002 migration
+        # block ran (defensive); we skip writes for missing columns silently.
+        ws_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col_ats_pct = ws_headers.index("ATS Coverage %") + 1 if "ATS Coverage %" in ws_headers else None
+        col_recruit = ws_headers.index("Recruiter Score") + 1 if "Recruiter Score" in ws_headers else None
+        col_hm      = ws_headers.index("HM Score") + 1 if "HM Score" in ws_headers else None
+        col_atsmiss = ws_headers.index("ATS Missing") + 1 if "ATS Missing" in ws_headers else None
+
+        for rec in records:
+            if isinstance(rec, dict):
+                resume_id   = rec["resume_id"]
+                jd_url      = rec["jd_url"]
+                match_json  = rec["match_json"]
+                resume_hash = rec.get("resume_hash", "")
+                stage       = rec.get("stage", "fine")
+            else:
+                resume_id, jd_url, match_json, resume_hash, stage = rec
             try:
                 d         = json.loads(match_json)
                 strengths = "\n".join(f"• {x}" for x in d.get("key_strengths", [])) or "None"
@@ -796,11 +835,27 @@ def batch_upsert_match_records(xlsx_path: str, records: list) -> int:
                             resume_hash, stage]
             key = (str(resume_id), str(jd_url))
             if key in idx:
+                target_row = idx[key]
                 for col, val in enumerate(row_data, 1):
-                    ws.cell(idx[key], col, val)
+                    ws.cell(target_row, col, val)
             else:
                 ws.append(row_data)
                 idx[key] = ws.max_row
+                target_row = idx[key]
+            # Optional 3-dim writes — only when key is PRESENT in dict (preserve
+            # otherwise). Tuple records skip this block entirely.
+            if isinstance(rec, dict):
+                if "ats_coverage_percent" in rec and col_ats_pct:
+                    ws.cell(target_row, col_ats_pct, rec["ats_coverage_percent"])
+                if "recruiter_score" in rec and col_recruit:
+                    ws.cell(target_row, col_recruit, rec["recruiter_score"])
+                if "hm_score" in rec and col_hm:
+                    ws.cell(target_row, col_hm, rec["hm_score"])
+                if "ats_missing" in rec and col_atsmiss:
+                    missing = rec["ats_missing"] or []
+                    # Empty list → None (openpyxl reads back "" as None anyway).
+                    ws.cell(target_row, col_atsmiss,
+                            ", ".join(missing[:5]) if missing else None)
         wb.save(xlsx_path)
         return len(records)
     finally:

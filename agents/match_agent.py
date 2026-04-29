@@ -59,6 +59,11 @@ from shared.rate_limiter import _RateLimiter
 from shared.config import MODEL
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
 from shared.run_summary import RunSummary
+from shared.ats_matcher import compute_coverage
+
+# PRJ-002: Coverage % below this gets a ⚠️ marker in the printed summary.
+# Soft signal only — JDs are NOT dropped or excluded from fine eval.
+ATS_COVERAGE_LOW_THRESHOLD = 30.0
 
 # BUG-41: single shared limiter across Stage 1 and Stage 2
 _GEMINI_LIMITER = _RateLimiter(rpm=13)
@@ -132,6 +137,30 @@ def _format_jd_for_coarse(jd: dict) -> str:
         return "\n\n".join(parts)
     except Exception:
         return jd["jd_json"]
+
+
+def _extract_ats_keywords(jd: dict) -> list[str]:
+    """Extract ats_keywords from a JD row's cached JSON. Empty list on legacy
+    JDs (cached before PR 1 added the field) or malformed JSON."""
+    try:
+        d = json.loads(jd["jd_json"])
+        kws = d.get("ats_keywords") or []
+        return [str(k) for k in kws if k]
+    except Exception:
+        return []
+
+
+def compute_ats_for_jds(resume_text: str, jds: list[dict]) -> dict[str, dict]:
+    """Compute ATS coverage for each JD. Returns {url: coverage_dict}.
+
+    Deterministic, no LLM, no rate limiter. Skips JDs whose ats_keywords
+    field is empty (legacy JDs); coverage_dict has percent=None for those.
+    """
+    out: dict[str, dict] = {}
+    for jd in jds:
+        kws = _extract_ats_keywords(jd)
+        out[jd["url"]] = compute_coverage(kws, resume_text)
+    return out
 
 
 def batch_coarse_score(resume_text: str, jds_batch: list[dict]) -> list[int]:
@@ -359,6 +388,25 @@ async def _main_inner(summary: RunSummary):
     summary.skipped += len(already_fine) + len(already_coarse)
     summary.attempted += len(pending_jds)
 
+    # ── ATS dim (PRJ-002): deterministic keyword coverage, no LLM ─────────────
+    # Run on the same set of JDs that go through Recruiter scoring (pending).
+    # Already-scored JDs from previous runs keep whatever ATS % was written
+    # last time; clearing Match_Results triggers a full re-score with fresh ATS.
+    ats_results: dict[str, dict] = compute_ats_for_jds(resume_text, pending_jds)
+    if ats_results:
+        with_data = [u for u, c in ats_results.items() if c.get("percent") is not None]
+        if with_data:
+            avg_pct = sum(ats_results[u]["percent"] for u in with_data) / len(with_data)
+            low_count = sum(
+                1 for u in with_data
+                if ats_results[u]["percent"] < ATS_COVERAGE_LOW_THRESHOLD
+            )
+            print(f"🔍 ATS coverage: {len(with_data)} JD(s) scored, "
+                  f"avg {avg_pct:.1f}%, {low_count} below {ATS_COVERAGE_LOW_THRESHOLD:.0f}% ⚠️")
+        legacy = len(ats_results) - len(with_data)
+        if legacy:
+            print(f"   ({legacy} JD(s) lack ats_keywords — re-run job_agent to populate.)")
+
     # Batch coarse scoring in groups of 10
     coarse_scores: dict[str, int] = {}
     if pending_jds:
@@ -385,17 +433,30 @@ async def _main_inner(summary: RunSummary):
             logging.info(f"[Stage1] Batch {b+1} scores: {scores}")
         summary.succeeded += len(coarse_scores)
 
-        # Only write records for JDs that received a real score.
-        coarse_records = [
-            (resume_id, jd["url"], json.dumps({
-                "compatibility_score": coarse_scores[jd["url"]],
-                "key_strengths": [],
-                "critical_gaps": [],
-                "recommendation_reason": "Coarse screening score — pending fine evaluation.",
-            }), resume_hash, "coarse")
-            for jd in pass_jds
-            if jd["url"] in coarse_scores
-        ]
+        # Stage 1 records: dict format. Score column mirrors Recruiter Score.
+        # ATS / Recruiter / HM populated; HM=None until Stage 2 runs.
+        coarse_records = []
+        for jd in pass_jds:
+            url = jd["url"]
+            if url not in coarse_scores:
+                continue
+            ats = ats_results.get(url, {})
+            coarse_records.append({
+                "resume_id":  resume_id,
+                "jd_url":     url,
+                "match_json": json.dumps({
+                    "compatibility_score": coarse_scores[url],
+                    "key_strengths":       [],
+                    "critical_gaps":       [],
+                    "recommendation_reason": "Recruiter (Stage 1) score — pending HM evaluation.",
+                }),
+                "resume_hash":           resume_hash,
+                "stage":                 "coarse",
+                "ats_coverage_percent":  ats.get("percent"),
+                "ats_missing":           ats.get("missing", []),
+                "recruiter_score":       coarse_scores[url],
+                "hm_score":              None,
+            })
         if coarse_records:
             batch_upsert_match_records(xlsx_path, coarse_records)
         logging.info(f"[Stage1] Wrote {len(coarse_records)} coarse records "
@@ -484,7 +545,17 @@ async def _main_inner(summary: RunSummary):
                     summary.structural_errors += 1
                     summary.failed += 1
                     return
-                fine_records.append((resume_id, url, result_json, resume_hash, "fine"))
+                # Dict format with hm_score only — preserves ATS Coverage %
+                # and Recruiter Score that Stage 1 wrote (the upsert uses
+                # "key absent → leave column unchanged" semantics).
+                fine_records.append({
+                    "resume_id":   resume_id,
+                    "jd_url":      url,
+                    "match_json":  result_json,
+                    "resume_hash": resume_hash,
+                    "stage":       "fine",
+                    "hm_score":    score,
+                })
                 summary.succeeded += 1
                 print(f"    Score: {score}/100")
 

@@ -705,6 +705,151 @@ class TestMatchHelpers(unittest.TestCase):
         self.assertEqual(pairs[("rx", "https://bad.com/jd")]["score"], 0)
 
 
+class TestPRJ002BatchUpsertDictFormat(unittest.TestCase):
+    """PRJ-002 PR 3 — dict-format records write 3-dim columns; tuple format
+    still works (back-compat); 'key absent' on dicts preserves prior values."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _read_row(self, key=("r1", "https://a.com/1")):
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Match_Results"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value == key[0] and ws.cell(r, 2).value == key[1]:
+                row = {h: ws.cell(r, c + 1).value for c, h in enumerate(headers)}
+                wb.close()
+                return row
+        wb.close()
+        return None
+
+    def _match_json(self, score=70, strengths=None, gaps=None, reason="ok"):
+        return json.dumps({
+            "compatibility_score": score,
+            "key_strengths": strengths or [],
+            "critical_gaps": gaps or [],
+            "recommendation_reason": reason,
+        })
+
+    def test_dict_record_writes_all_three_dim_columns(self):
+        rec = {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(70),
+            "resume_hash": "h", "stage": "coarse",
+            "ats_coverage_percent": 78.5,
+            "ats_missing": ["Rust", "Erlang"],
+            "recruiter_score": 70,
+            "hm_score": None,
+        }
+        batch_upsert_match_records(self.path, [rec])
+        row = self._read_row()
+        self.assertEqual(row["ATS Coverage %"], 78.5)
+        self.assertEqual(row["Recruiter Score"], 70)
+        self.assertIsNone(row["HM Score"])
+        self.assertEqual(row["ATS Missing"], "Rust, Erlang")
+
+    def test_ats_missing_caps_at_top_5(self):
+        rec = {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(50),
+            "resume_hash": "h", "stage": "coarse",
+            "ats_missing": ["a", "b", "c", "d", "e", "f", "g"],
+        }
+        batch_upsert_match_records(self.path, [rec])
+        row = self._read_row()
+        self.assertEqual(row["ATS Missing"], "a, b, c, d, e")
+
+    def test_ats_missing_empty_list_writes_blank(self):
+        rec = {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(80),
+            "resume_hash": "h", "stage": "coarse",
+            "ats_missing": [],
+        }
+        batch_upsert_match_records(self.path, [rec])
+        row = self._read_row()
+        self.assertIsNone(row["ATS Missing"])
+
+    def test_stage2_omits_ats_recruiter_preserves_prior(self):
+        # Stage 1: write ATS=78, Recruiter=70.
+        batch_upsert_match_records(self.path, [{
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(70),
+            "resume_hash": "h", "stage": "coarse",
+            "ats_coverage_percent": 78.5,
+            "ats_missing": ["Rust"],
+            "recruiter_score": 70,
+            "hm_score": None,
+        }])
+        # Stage 2: only HM dim, omits ATS / Recruiter keys entirely.
+        batch_upsert_match_records(self.path, [{
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(45, ["s"], ["g"], "deep"),
+            "resume_hash": "h", "stage": "fine",
+            "hm_score": 45,
+        }])
+        row = self._read_row()
+        # Legacy Score column reflects the latest (HM=45).
+        self.assertEqual(row["Score"], 45)
+        self.assertEqual(row["Stage"], "fine")
+        # Per-dim columns: ATS / Recruiter preserved from Stage 1; HM updated.
+        self.assertEqual(row["ATS Coverage %"], 78.5)
+        self.assertEqual(row["Recruiter Score"], 70)
+        self.assertEqual(row["HM Score"], 45)
+        self.assertEqual(row["ATS Missing"], "Rust")
+
+    def test_tuple_format_still_works_back_compat(self):
+        # Legacy 5-tuple — must NOT break, must NOT touch new columns.
+        records = [("r1", "https://a.com/1", self._match_json(80), "h", "fine")]
+        batch_upsert_match_records(self.path, records)
+        row = self._read_row()
+        self.assertEqual(row["Score"], 80)
+        self.assertEqual(row["Stage"], "fine")
+        self.assertIsNone(row["ATS Coverage %"])
+        self.assertIsNone(row["Recruiter Score"])
+        self.assertIsNone(row["HM Score"])
+
+    def test_mixed_tuple_and_dict_in_one_batch(self):
+        records = [
+            ("r1", "https://a.com/1", self._match_json(70), "h", "coarse"),
+            {
+                "resume_id": "r1", "jd_url": "https://a.com/2",
+                "match_json": self._match_json(85),
+                "resume_hash": "h", "stage": "fine",
+                "hm_score": 85,
+                "ats_coverage_percent": 60.0,
+            },
+        ]
+        n = batch_upsert_match_records(self.path, records)
+        self.assertEqual(n, 2)
+        row1 = self._read_row(("r1", "https://a.com/1"))
+        row2 = self._read_row(("r1", "https://a.com/2"))
+        self.assertIsNone(row1["HM Score"])
+        self.assertEqual(row2["HM Score"], 85)
+        self.assertEqual(row2["ATS Coverage %"], 60.0)
+
+    def test_ats_percent_none_writes_none(self):
+        # Legacy JD with no ats_keywords yields percent=None — must round-trip.
+        rec = {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(70),
+            "resume_hash": "h", "stage": "coarse",
+            "ats_coverage_percent": None,
+            "ats_missing": [],
+            "recruiter_score": 70,
+        }
+        batch_upsert_match_records(self.path, [rec])
+        row = self._read_row()
+        self.assertIsNone(row["ATS Coverage %"])
+        self.assertEqual(row["Recruiter Score"], 70)
+
+
 class TestBug12WorkbookClose(unittest.TestCase):
     """BUG-12 regression: every load_workbook() call must be followed by wb.close()."""
 

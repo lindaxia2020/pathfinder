@@ -43,6 +43,9 @@ from agents.match_agent import (
     batch_coarse_score,
     evaluate_match,
     _select_fine_candidates,
+    _extract_ats_keywords,
+    compute_ats_for_jds,
+    ATS_COVERAGE_LOW_THRESHOLD,
 )
 import agents.match_agent as match_agent_mod
 
@@ -718,6 +721,83 @@ class TestBug31NoSubclassNeeded(unittest.TestCase):
         pool = _GeminiKeyPoolBase(["key1"], genai_mod=mock_genai)
         result = pool.generate_content("model", "content", MagicMock())
         mock_genai.Client.assert_called_with(api_key="key1")
+
+
+class TestExtractATSKeywords(unittest.TestCase):
+    """PRJ-002 PR 3 — JD-level ATS keyword extraction with graceful fallbacks."""
+
+    def test_extracts_when_present(self):
+        jd = {"jd_json": json.dumps({
+            "job_title": "TPM",
+            "ats_keywords": ["PyTorch", "Kubernetes", "LLM"],
+        })}
+        self.assertEqual(_extract_ats_keywords(jd), ["PyTorch", "Kubernetes", "LLM"])
+
+    def test_empty_list_when_field_missing(self):
+        # Legacy JDs cached before PR 1 don't have ats_keywords.
+        jd = {"jd_json": json.dumps({"job_title": "TPM"})}
+        self.assertEqual(_extract_ats_keywords(jd), [])
+
+    def test_empty_list_when_field_null(self):
+        jd = {"jd_json": json.dumps({"ats_keywords": None})}
+        self.assertEqual(_extract_ats_keywords(jd), [])
+
+    def test_empty_list_on_malformed_json(self):
+        jd = {"jd_json": "not-json{"}
+        self.assertEqual(_extract_ats_keywords(jd), [])
+
+    def test_filters_blank_entries(self):
+        jd = {"jd_json": json.dumps({
+            "ats_keywords": ["PyTorch", "", None, "Kubernetes"],
+        })}
+        self.assertEqual(_extract_ats_keywords(jd), ["PyTorch", "Kubernetes"])
+
+    def test_coerces_non_string_entries(self):
+        jd = {"jd_json": json.dumps({"ats_keywords": ["PyTorch", 42]})}
+        # Numbers stringified — defensive against malformed Gemini output.
+        self.assertEqual(_extract_ats_keywords(jd), ["PyTorch", "42"])
+
+
+class TestComputeATSForJDs(unittest.TestCase):
+    """PRJ-002 PR 3 — orchestrator that runs ats_matcher across many JDs."""
+
+    def test_returns_one_entry_per_jd(self):
+        jds = [
+            {"url": "https://a.com/1", "jd_json": json.dumps({
+                "ats_keywords": ["PyTorch", "Kubernetes"],
+            })},
+            {"url": "https://a.com/2", "jd_json": json.dumps({
+                "ats_keywords": ["Rust", "Go"],
+            })},
+        ]
+        results = compute_ats_for_jds("Senior TPM with PyTorch and Kubernetes.", jds)
+        self.assertEqual(set(results.keys()), {"https://a.com/1", "https://a.com/2"})
+        self.assertEqual(results["https://a.com/1"]["percent"], 100.0)
+        self.assertEqual(results["https://a.com/2"]["percent"], 0.0)
+
+    def test_legacy_jd_returns_none_percent(self):
+        # JD without ats_keywords → percent=None signalling "no ATS data".
+        jds = [{"url": "https://a.com/1", "jd_json": json.dumps({"job_title": "TPM"})}]
+        results = compute_ats_for_jds("anything", jds)
+        self.assertIsNone(results["https://a.com/1"]["percent"])
+
+    def test_no_lazy_load(self):
+        # compute_ats_for_jds must NOT call any Gemini / network APIs.
+        # If it does, the MagicMock would return non-list types.
+        jds = [{"url": "https://a.com/1", "jd_json": json.dumps({
+            "ats_keywords": ["PyTorch"],
+        })}]
+        # Simulate a pool that would error if accessed.
+        match_agent_mod._KEY_POOL = None
+        results = compute_ats_for_jds("PyTorch user", jds)
+        self.assertEqual(results["https://a.com/1"]["percent"], 100.0)
+
+
+class TestATSCoverageLowThreshold(unittest.TestCase):
+    """The ⚠️ threshold for low ATS coverage is a soft signal, not a gate."""
+
+    def test_threshold_is_30_percent(self):
+        self.assertEqual(ATS_COVERAGE_LOW_THRESHOLD, 30.0)
 
 
 class TestSelectFineCandidates(unittest.TestCase):
