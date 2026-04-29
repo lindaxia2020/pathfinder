@@ -59,16 +59,6 @@ FINE_SYSTEM_PROMPT = (
 )
 
 
-BATCH_FINE_SYSTEM_PROMPT = (
-    FINE_SYSTEM_PROMPT + "\n\n"
-    "BATCH MODE:\n"
-    "You will receive multiple (resume, JD) pairs numbered [PAIR 0], [PAIR 1], etc.\n"
-    "Evaluate each pair independently.\n"
-    "Return a BatchMatchResult JSON with one BatchMatchItem per pair, "
-    "using the 0-based index to match each result to its input pair."
-)
-
-
 TAILOR_SYSTEM_PROMPT = (
     "You are a Resume Optimization Specialist for ATS (Applicant Tracking System) optimization.\n\n"
     "STRICT RULES:\n"

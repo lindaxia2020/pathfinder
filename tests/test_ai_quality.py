@@ -33,7 +33,6 @@ from shared.prompts import (
     FINE_SYSTEM_PROMPT,
     COARSE_SYSTEM_PROMPT as _COARSE_SYSTEM_PROMPT,
     TAILOR_SYSTEM_PROMPT as _TAILOR_SYSTEM_PROMPT,
-    BATCH_FINE_SYSTEM_PROMPT as _BATCH_FINE_SYSTEM_PROMPT,
 )
 from shared.schemas import (
     CoarseItem, BatchCoarseResult,
@@ -52,7 +51,6 @@ import agents.match_agent as match_mod
 
 from agents.resume_optimizer import (
     MatchResult as OptimizerMatchResult,
-    batch_re_score,
     re_score,
 )
 import agents.resume_optimizer as optimizer_mod
@@ -63,14 +61,15 @@ class TestFinePromptConsistency(unittest.TestCase):
     """REQ-052: resume_optimizer must use the EXACT same fine prompt as match_agent."""
 
     def test_fine_prompt_exact_match(self):
-        """Full assertEqual — not substring, not 'in', exact equality."""
+        """Full assertEqual — not substring, not 'in', exact equality.
+
+        After Phase 2 of the 2026-04-28 review, optimizer's re-score uses
+        the same single-call FINE_SYSTEM_PROMPT as match_agent.evaluate_match,
+        so Score Delta reflects the resume change rather than batch-context
+        anchoring artifacts.
+        """
         self.assertEqual(MATCH_FINE_PROMPT, OPTIMIZER_FINE_PROMPT,
                          "match_agent._FINE_SYSTEM_PROMPT != resume_optimizer._FINE_SYSTEM_PROMPT")
-
-    def test_batch_fine_prompt_starts_with_fine_prompt(self):
-        """_BATCH_FINE_SYSTEM_PROMPT must start with the same fine prompt."""
-        self.assertTrue(_BATCH_FINE_SYSTEM_PROMPT.startswith(OPTIMIZER_FINE_PROMPT),
-                        "_BATCH_FINE_SYSTEM_PROMPT does not start with _FINE_SYSTEM_PROMPT")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -104,20 +103,6 @@ class TestStructuralErrorDropsRecord(unittest.TestCase):
             self.assertEqual(scores, [])
         finally:
             match_mod._KEY_POOL = None
-
-    def test_optimizer_batch_re_score_returns_empty_dicts_on_structural(self):
-        from shared.exceptions import GeminiStructuralError
-        mock_pool = MagicMock()
-        mock_pool.generate_content.side_effect = GeminiStructuralError("schema fail")
-        optimizer_mod._KEY_POOL = mock_pool
-        try:
-            results = batch_re_score([{"tailored_resume": "r", "jd_content": "j"}] * 2)
-            for r in results:
-                self.assertEqual(r, {},
-                                 "structural error must yield empty-dict sentinel, "
-                                 "not a fake compatibility_score=0")
-        finally:
-            optimizer_mod._KEY_POOL = None
 
     def test_optimizer_re_score_returns_none_on_structural(self):
         from shared.exceptions import GeminiStructuralError
@@ -165,18 +150,6 @@ class TestTransientErrorBubblesUp(unittest.TestCase):
                 re_score("resume", "jd")
         finally:
             optimizer_mod._KEY_POOL = None
-
-    def test_optimizer_batch_re_score_reraises_transient(self):
-        from shared.exceptions import GeminiTransientError
-        mock_pool = MagicMock()
-        mock_pool.generate_content.side_effect = GeminiTransientError("429")
-        optimizer_mod._KEY_POOL = mock_pool
-        try:
-            with self.assertRaises(GeminiTransientError):
-                batch_re_score([{"tailored_resume": "r", "jd_content": "j"}])
-        finally:
-            optimizer_mod._KEY_POOL = None
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 class TestCoarseItemScoreDescription(unittest.TestCase):

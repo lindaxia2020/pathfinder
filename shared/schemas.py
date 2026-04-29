@@ -36,15 +36,3 @@ class BatchTailoredItem(BaseModel):
 
 class BatchTailoredResult(BaseModel):
     items: list[BatchTailoredItem] = Field(description="One entry per JD in the batch.")
-
-
-class BatchMatchItem(BaseModel):
-    index: int = Field(description="0-based index of the (resume, JD) pair in the batch.")
-    compatibility_score: int = Field(description="0-100 fit score.")
-    key_strengths: list[str]
-    critical_gaps: list[str]
-    recommendation_reason: str = Field(description="Specific, weighted analysis per criteria.")
-
-
-class BatchMatchResult(BaseModel):
-    items: list[BatchMatchItem] = Field(description="One entry per (resume, JD) pair in the batch.")
