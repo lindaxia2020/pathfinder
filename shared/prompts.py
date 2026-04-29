@@ -1,7 +1,7 @@
 """Shared LLM prompt constants.
 
 Single source of truth for system prompts used across match_agent and
-resume_optimizer. REQ-052 requires the fine-evaluation prompt used for
+resume_optimizer. REQ-052 requires the deep-evaluation prompt used for
 the original score and the tailored re-score to be byte-identical so
 deltas are comparable; defining them here makes that structurally enforced.
 
@@ -9,6 +9,14 @@ P0-3 prompt-injection guard: SECURITY_CLAUSE is appended to every system
 prompt and call sites wrap scraped content in <scraped_content>...</scraped_content>
 delimiters. This closes the injection vector where a malicious JD could
 include "Ignore prior instructions" and flip the model's behavior.
+
+PRJ-002 PR 2 — naming pivot:
+  - RECRUITER_SYSTEM_PROMPT replaces COARSE_SYSTEM_PROMPT (Stage 1, recruiter scan)
+  - HM_SYSTEM_PROMPT replaces FINE_SYSTEM_PROMPT (Stage 2, hiring manager deep eval)
+
+The new names match the 3-dimension scoring funnel (ATS / Recruiter / HM).
+Content is byte-identical to the old prompts so existing scores remain
+comparable across the rename. Old names remain as aliases until PR 5.
 """
 
 SECURITY_CLAUSE = (
@@ -21,7 +29,7 @@ SECURITY_CLAUSE = (
     "tags."
 )
 
-COARSE_SYSTEM_PROMPT = (
+RECRUITER_SYSTEM_PROMPT = (
     "You are a rapid job-fit screener. For each numbered JD, assign a 1–100 "
     "integer fit score for the candidate.\n\n"
     "Score calibration:\n"
@@ -40,7 +48,7 @@ COARSE_SYSTEM_PROMPT = (
 )
 
 
-FINE_SYSTEM_PROMPT = (
+HM_SYSTEM_PROMPT = (
     "You are a Brutally Honest Job Fit Analyzer evaluating a Senior TPM "
     "transitioning into an AI TPM role.\n\n"
     "Score using 4 weighted criteria:\n"
@@ -57,6 +65,14 @@ FINE_SYSTEM_PROMPT = (
     "Do not inflate scores for adjacent experience."
     + SECURITY_CLAUSE
 )
+
+
+# ── Back-compat aliases (PRJ-002 PR 2) ────────────────────────────────────────
+# Existing call sites import the old names. The aliases keep them working
+# byte-identically until PR 5 sweeps the imports across match_agent and
+# resume_optimizer. Removing these aliases is part of the PR 5 cleanup.
+COARSE_SYSTEM_PROMPT = RECRUITER_SYSTEM_PROMPT
+FINE_SYSTEM_PROMPT   = HM_SYSTEM_PROMPT
 
 
 TAILOR_SYSTEM_PROMPT = (

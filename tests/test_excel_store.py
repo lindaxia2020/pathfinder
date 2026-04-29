@@ -1070,18 +1070,29 @@ class TestBatchUpsertTailoredRecords(unittest.TestCase):
 
 
 class TestTailoredHeadersHasRegression(unittest.TestCase):
-    """TAILORED_HEADERS must include the Regression column."""
+    """TAILORED_HEADERS must include the Regression column at column 12."""
 
     def test_regression_in_headers(self):
         self.assertIn("Regression", TAILORED_HEADERS)
 
-    def test_regression_is_last_column(self):
-        """Migration appends Regression at the end so old col indices stay valid."""
-        self.assertEqual(TAILORED_HEADERS[-1], "Regression")
+    def test_regression_position_stable(self):
+        """Regression must stay at column 12 (index 11) so existing readers
+        with hardcoded column references keep working. PR 2 appends NEW
+        per-dim columns AFTER Regression — Regression itself doesn't move.
+        """
+        self.assertEqual(TAILORED_HEADERS.index("Regression"), 11)
 
 
 class TestTailoredMigration(unittest.TestCase):
     """Existing files without Regression column should auto-migrate on open."""
+
+    # Pre-P0-12 schema: 11 columns, no Regression, no per-dim columns.
+    # Hardcoded so the test is stable across future schema additions.
+    _PRE_P0_12_HEADERS = [
+        "Resume ID", "JD URL", "Job Title", "Company", "Original Score",
+        "Tailored Score", "Score Delta", "Tailored Resume Path",
+        "Optimization Summary", "Updated At", "Resume Hash",
+    ]
 
     def test_migration_adds_regression_column(self):
         path = _tmp_xlsx()
@@ -1089,8 +1100,7 @@ class TestTailoredMigration(unittest.TestCase):
             wb = openpyxl.Workbook()
             ws = wb.active
             ws.title = "Tailored_Match_Results"
-            old_headers = [h for h in TAILORED_HEADERS if h != "Regression"]
-            ws.append(old_headers)
+            ws.append(self._PRE_P0_12_HEADERS)
             ws.append(["r1", "https://a.com/1", "TPM", "Co", 80, 70, -10,
                        "p", "s", "2026-01-01", "h"])
             ws.append(["r1", "https://a.com/2", "TPM", "Co", 60, 80, 20,
@@ -1110,6 +1120,188 @@ class TestTailoredMigration(unittest.TestCase):
             reg_col = headers.index("Regression") + 1
             self.assertEqual(ws.cell(2, reg_col).value, True)   # delta=-10
             self.assertEqual(ws.cell(3, reg_col).value, False)  # delta=+20
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+class TestPRJ002Headers(unittest.TestCase):
+    """PRJ-002 PR 2 — 3-dimension scoring columns must be in headers."""
+
+    def test_match_headers_has_ats_coverage(self):
+        self.assertIn("ATS Coverage %", MATCH_HEADERS)
+
+    def test_match_headers_has_recruiter_score(self):
+        self.assertIn("Recruiter Score", MATCH_HEADERS)
+
+    def test_match_headers_has_hm_score(self):
+        self.assertIn("HM Score", MATCH_HEADERS)
+
+    def test_match_headers_has_ats_missing(self):
+        self.assertIn("ATS Missing", MATCH_HEADERS)
+
+    def test_match_legacy_columns_unchanged(self):
+        # Old column indices must stay valid for back-compat readers.
+        self.assertEqual(MATCH_HEADERS.index("Score"), 2)
+        self.assertEqual(MATCH_HEADERS.index("Resume Hash"), 7)
+        self.assertEqual(MATCH_HEADERS.index("Stage"), 8)
+
+    def test_tailored_headers_has_per_dim_columns(self):
+        for col in ("Original ATS", "Tailored ATS", "ATS Delta",
+                    "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
+                    "Original HM", "Tailored HM", "HM Delta"):
+            self.assertIn(col, TAILORED_HEADERS, f"Missing column: {col}")
+
+    def test_tailored_legacy_columns_unchanged(self):
+        # Old column indices must stay valid.
+        self.assertEqual(TAILORED_HEADERS.index("Original Score"), 4)
+        self.assertEqual(TAILORED_HEADERS.index("Tailored Score"), 5)
+        self.assertEqual(TAILORED_HEADERS.index("Score Delta"), 6)
+        self.assertEqual(TAILORED_HEADERS.index("Resume Hash"), 10)
+        self.assertEqual(TAILORED_HEADERS.index("Regression"), 11)
+
+
+class TestPRJ002MatchResultsMigration(unittest.TestCase):
+    """PRJ-002 PR 2 — Match_Results gains 4 columns; old files auto-migrate."""
+
+    # Pre-PRJ-002 Match_Results schema: 9 columns (post-P0 stage column).
+    _PRE_PRJ002_HEADERS = [
+        "Resume ID", "JD URL", "Score", "Strengths", "Gaps", "Reason",
+        "Updated At", "Resume Hash", "Stage",
+    ]
+
+    def test_migration_adds_three_dim_columns(self):
+        path = _tmp_xlsx()
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Match_Results"
+            ws.append(self._PRE_PRJ002_HEADERS)
+            ws.append(["r1", "https://a.com/1", 75, "s1", "g1", "ok",
+                       "2026-01-01", "h", "fine"])
+            for required in ("Company_List", "Company_Without_TPM", "JD_Tracker",
+                             "Tailored_Match_Results"):
+                wb.create_sheet(required)
+            wb.save(path)
+            wb.close()
+
+            get_or_create_excel(path)
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["Match_Results"]
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            for new_col in ("ATS Coverage %", "Recruiter Score", "HM Score", "ATS Missing"):
+                self.assertIn(new_col, headers)
+            # Existing row's legacy columns untouched.
+            self.assertEqual(ws.cell(2, 3).value, 75)
+            self.assertEqual(ws.cell(2, 9).value, "fine")
+            # New columns blank for the existing row.
+            for new_col in ("ATS Coverage %", "Recruiter Score", "HM Score", "ATS Missing"):
+                col = headers.index(new_col) + 1
+                self.assertIsNone(ws.cell(2, col).value)
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_migration_idempotent(self):
+        """Running get_or_create_excel twice should not duplicate new columns."""
+        path = _tmp_xlsx()
+        try:
+            get_or_create_excel(path)
+            get_or_create_excel(path)
+            wb = openpyxl.load_workbook(path)
+            ws = wb["Match_Results"]
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            self.assertEqual(headers.count("ATS Coverage %"), 1)
+            self.assertEqual(headers.count("HM Score"), 1)
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+
+class TestPRJ002TailoredMigration(unittest.TestCase):
+    """PRJ-002 PR 2 — Tailored_Match_Results gains 9 per-dim columns."""
+
+    # Post-P0-12, pre-PRJ-002: 12 columns.
+    _PRE_PRJ002_HEADERS = [
+        "Resume ID", "JD URL", "Job Title", "Company", "Original Score",
+        "Tailored Score", "Score Delta", "Tailored Resume Path",
+        "Optimization Summary", "Updated At", "Resume Hash", "Regression",
+    ]
+
+    def test_migration_adds_nine_per_dim_columns(self):
+        path = _tmp_xlsx()
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Tailored_Match_Results"
+            ws.append(self._PRE_PRJ002_HEADERS)
+            ws.append(["r1", "https://a.com/1", "TPM", "Co", 60, 80, 20,
+                       "p", "s", "2026-01-01", "h", False])
+            for required in ("Company_List", "Company_Without_TPM", "JD_Tracker",
+                             "Match_Results"):
+                wb.create_sheet(required)
+            wb.save(path)
+            wb.close()
+
+            get_or_create_excel(path)
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["Tailored_Match_Results"]
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            for new_col in ("Original ATS", "Tailored ATS", "ATS Delta",
+                            "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
+                            "Original HM", "Tailored HM", "HM Delta"):
+                self.assertIn(new_col, headers)
+            # Legacy columns and values untouched.
+            self.assertEqual(ws.cell(2, 5).value, 60)   # Original Score
+            self.assertEqual(ws.cell(2, 6).value, 80)   # Tailored Score
+            self.assertEqual(ws.cell(2, 7).value, 20)   # Score Delta
+            self.assertEqual(ws.cell(2, 12).value, False)  # Regression
+            wb.close()
+        finally:
+            if os.path.exists(path):
+                os.remove(path)
+
+    def test_full_migration_pre_p0_12_to_latest(self):
+        """End-to-end: pre-P0-12 schema (no Regression, no dim cols) → latest.
+
+        This verifies that BOTH the P0-12 Regression migration and the
+        PRJ-002 dim-column migration run successfully on a single
+        outdated file.
+        """
+        path = _tmp_xlsx()
+        try:
+            wb = openpyxl.Workbook()
+            ws = wb.active
+            ws.title = "Tailored_Match_Results"
+            ws.append([
+                "Resume ID", "JD URL", "Job Title", "Company", "Original Score",
+                "Tailored Score", "Score Delta", "Tailored Resume Path",
+                "Optimization Summary", "Updated At", "Resume Hash",
+            ])
+            ws.append(["r1", "https://a.com/1", "TPM", "Co", 80, 70, -10,
+                       "p", "s", "2026-01-01", "h"])
+            for required in ("Company_List", "Company_Without_TPM", "JD_Tracker",
+                             "Match_Results"):
+                wb.create_sheet(required)
+            wb.save(path)
+            wb.close()
+
+            get_or_create_excel(path)
+
+            wb = openpyxl.load_workbook(path)
+            ws = wb["Tailored_Match_Results"]
+            headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+            # All target columns now present
+            for col in ("Regression", "Original ATS", "HM Delta"):
+                self.assertIn(col, headers)
+            # Regression backfilled from delta < 0
+            reg_col = headers.index("Regression") + 1
+            self.assertTrue(ws.cell(2, reg_col).value)
             wb.close()
         finally:
             if os.path.exists(path):

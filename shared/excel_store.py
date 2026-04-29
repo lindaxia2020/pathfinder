@@ -19,10 +19,19 @@ WITHOUT_TPM_HEADERS      = ["Company Name", "AI Domain", "Business Focus", "Care
 JD_HEADERS      = ["JD URL", "Job Title", "Company", "Location", "Salary", "Requirements",
                    "Additional Qualifications", "Responsibilities", "Is AI TPM", "Updated At", "MD Hash",
                    "Data Quality"]
-MATCH_HEADERS   = ["Resume ID", "JD URL", "Score", "Strengths", "Gaps", "Reason", "Updated At", "Resume Hash", "Stage"]
+# PRJ-002 PR 2: 3-dimension scoring columns appended at end so existing
+# column indices stay valid. PR 3/PR 4 wire up the upsert paths to populate
+# them — for now they're added by migration and left blank for old rows.
+MATCH_HEADERS   = ["Resume ID", "JD URL", "Score", "Strengths", "Gaps", "Reason",
+                   "Updated At", "Resume Hash", "Stage",
+                   "ATS Coverage %", "Recruiter Score", "HM Score", "ATS Missing"]
 TAILORED_HEADERS = ["Resume ID", "JD URL", "Job Title", "Company", "Original Score",
                     "Tailored Score", "Score Delta", "Tailored Resume Path",
-                    "Optimization Summary", "Updated At", "Resume Hash", "Regression"]
+                    "Optimization Summary", "Updated At", "Resume Hash", "Regression",
+                    # 3-dimension per-stage scores + deltas (PRJ-002 PR 2):
+                    "Original ATS", "Tailored ATS", "ATS Delta",
+                    "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
+                    "Original HM", "Tailored HM", "HM Delta"]
 
 # BUG-52: pre-computed 1-based column indices for JD_Tracker lookups
 _JD_COL = {h: i + 1 for i, h in enumerate(JD_HEADERS)}
@@ -145,6 +154,19 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     changed = True
                     import logging as _log
                     _log.info("[Excel] Migrated Match_Results: added 'Resume Hash' and 'Stage' columns.")
+                # PRJ-002 PR 2: append 3-dimension scoring columns. Leaving
+                # values blank for existing rows is intentional — the user
+                # re-runs match_agent to populate them after upgrade.
+                mr_headers = [ws_mr.cell(1, c).value for c in range(1, ws_mr.max_column + 1)]
+                _new_match_cols = ["ATS Coverage %", "Recruiter Score", "HM Score", "ATS Missing"]
+                _missing = [c for c in _new_match_cols if c not in mr_headers]
+                if _missing:
+                    for col_name in _missing:
+                        next_col = ws_mr.max_column + 1
+                        ws_mr.cell(1, next_col).value = col_name
+                    changed = True
+                    import logging as _log
+                    _log.info(f"[Excel] Migrated Match_Results: added {_missing} columns.")
             # Migrate Tailored_Match_Results: add "Regression" column if missing.
             # Backfill: existing rows are marked TRUE iff Score Delta < 0.
             if "Tailored_Match_Results" in wb.sheetnames:
@@ -164,6 +186,22 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     changed = True
                     import logging as _log
                     _log.info("[Excel] Migrated Tailored_Match_Results: added 'Regression' column.")
+                # PRJ-002 PR 2: append 9 per-dimension columns. Existing rows
+                # left blank — user re-runs the optimizer to populate them.
+                tm_headers = [ws_tm.cell(1, c).value for c in range(1, ws_tm.max_column + 1)]
+                _new_tailored_cols = [
+                    "Original ATS", "Tailored ATS", "ATS Delta",
+                    "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
+                    "Original HM", "Tailored HM", "HM Delta",
+                ]
+                _missing = [c for c in _new_tailored_cols if c not in tm_headers]
+                if _missing:
+                    for col_name in _missing:
+                        next_col = ws_tm.max_column + 1
+                        ws_tm.cell(1, next_col).value = col_name
+                    changed = True
+                    import logging as _log
+                    _log.info(f"[Excel] Migrated Tailored_Match_Results: added {_missing} columns.")
             if changed:
                 wb.save(xlsx_path)
         finally:

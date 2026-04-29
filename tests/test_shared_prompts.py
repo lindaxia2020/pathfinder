@@ -105,5 +105,47 @@ class TestNoLocalRedefinition(unittest.TestCase):
                          "resume_optimizer.py must not redefine MatchResult locally")
 
 
+class TestPRJ002RenamedPrompts(unittest.TestCase):
+    """PRJ-002 PR 2 — prompt rename pivot.
+
+    RECRUITER_SYSTEM_PROMPT replaces COARSE_SYSTEM_PROMPT (Stage 1 / recruiter).
+    HM_SYSTEM_PROMPT replaces FINE_SYSTEM_PROMPT (Stage 2 / hiring manager).
+    Back-compat aliases must point to the SAME string object (is, not ==) so
+    callers using either name see byte-identical content.
+    """
+
+    def test_recruiter_prompt_exists(self):
+        self.assertTrue(hasattr(prompts, "RECRUITER_SYSTEM_PROMPT"))
+        self.assertIsInstance(prompts.RECRUITER_SYSTEM_PROMPT, str)
+        self.assertGreater(len(prompts.RECRUITER_SYSTEM_PROMPT), 100)
+
+    def test_hm_prompt_exists(self):
+        self.assertTrue(hasattr(prompts, "HM_SYSTEM_PROMPT"))
+        self.assertIsInstance(prompts.HM_SYSTEM_PROMPT, str)
+        self.assertGreater(len(prompts.HM_SYSTEM_PROMPT), 100)
+
+    def test_coarse_alias_is_recruiter(self):
+        # Identity check, not equality — they must be the SAME object so
+        # 'is' comparisons elsewhere still hold and there's no string-table dup.
+        self.assertIs(prompts.COARSE_SYSTEM_PROMPT, prompts.RECRUITER_SYSTEM_PROMPT)
+
+    def test_fine_alias_is_hm(self):
+        self.assertIs(prompts.FINE_SYSTEM_PROMPT, prompts.HM_SYSTEM_PROMPT)
+
+    def test_pure_rename_no_content_drift(self):
+        # PR 2 promises byte-identical content across the rename so existing
+        # scores remain comparable. The recruiter prompt MUST still describe
+        # the rapid-screener persona; the HM prompt MUST still mention the
+        # 4 weighted criteria. Catches accidental rewrites in this PR.
+        self.assertIn("rapid job-fit screener", prompts.RECRUITER_SYSTEM_PROMPT)
+        self.assertIn("Score using 4 weighted criteria", prompts.HM_SYSTEM_PROMPT)
+        self.assertIn("AI/ML Tech Depth (30%)", prompts.HM_SYSTEM_PROMPT)
+
+    def test_security_clause_on_both_renamed_prompts(self):
+        # P0-3 prompt-injection guard must still wrap the renamed prompts.
+        self.assertIn("SECURITY:", prompts.RECRUITER_SYSTEM_PROMPT)
+        self.assertIn("SECURITY:", prompts.HM_SYSTEM_PROMPT)
+
+
 if __name__ == "__main__":
     unittest.main()
