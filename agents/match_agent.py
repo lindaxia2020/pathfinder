@@ -72,6 +72,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - [%(levelname)s] - 
 
 PROFILE_DIR = os.getenv("PROFILE_DIR", os.path.join(PROJECT_ROOT, "profile"))
 
+# Stage 2 fine-eval gating. JDs enter fine eval if EITHER:
+#   • coarse score >= MATCH_FINE_SCORE_THRESHOLD, or
+#   • coarse score is in the top MATCH_FINE_TOP_PERCENT% of this run.
+# Union semantics protect against both flat-high distributions (where
+# top-N% would discard genuine fits) and flat-low ones (where the
+# absolute threshold would select nothing).
+FINE_SCORE_THRESHOLD = int(os.getenv("MATCH_FINE_SCORE_THRESHOLD", "60"))
+FINE_TOP_PERCENT     = float(os.getenv("MATCH_FINE_TOP_PERCENT", "60"))
+
 
 _KEY_POOL: "_GeminiKeyPool | None" = None  # initialised in main()
 
@@ -225,6 +234,46 @@ def evaluate_match(resume_text: str, jd_json: str) -> str | None:
         return None
 
 
+def _select_fine_candidates(
+    scored: dict,
+    score_threshold: int,
+    top_percent: float,
+) -> tuple[list, dict]:
+    """Pick which coarse-scored JDs proceed to fine eval.
+
+    Selection is the UNION of two criteria:
+      • absolute: score >= score_threshold
+      • relative: score in the top `top_percent`% of this run
+
+    Only pairs still at stage="coarse" are returned (already-fine pairs are
+    skipped). Returns (to_fine_keys, stats) where stats is a dict with
+    keys n, top_count, top_cutoff, threshold_count for printing.
+    """
+    n = len(scored)
+    if n == 0:
+        return [], {"n": 0, "top_count": 0, "top_cutoff": 0, "threshold_count": 0}
+    sorted_keys = sorted(
+        scored.keys(),
+        key=lambda k: scored[k]["score"],
+        reverse=True,
+    )
+    top_n      = max(1, math.ceil(n * top_percent / 100))
+    top_keys   = set(sorted_keys[:top_n])
+    top_cutoff = scored[sorted_keys[top_n - 1]]["score"]
+    threshold_keys = {
+        k for k, v in scored.items() if v["score"] >= score_threshold
+    }
+    candidates = top_keys | threshold_keys
+    to_fine = [k for k in candidates if scored[k]["stage"] == "coarse"]
+    stats = {
+        "n": n,
+        "top_count": len(top_keys),
+        "top_cutoff": top_cutoff,
+        "threshold_count": len(threshold_keys),
+    }
+    return to_fine, stats
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 async def main():
     global _KEY_POOL
@@ -364,20 +413,16 @@ async def _main_inner(summary: RunSummary):
         _print_top_results(xlsx_path, resume_id)
         return
 
-    all_scores_sorted = sorted(
-        [v["score"] for v in scored_for_resume.values()], reverse=True
+    to_fine, stats = _select_fine_candidates(
+        scored_for_resume,
+        score_threshold=FINE_SCORE_THRESHOLD,
+        top_percent=FINE_TOP_PERCENT,
     )
-    top_n        = max(1, math.ceil(len(all_scores_sorted) * 0.20))
-    cutoff_score = all_scores_sorted[top_n - 1]
 
-    to_fine = [
-        k for k, v in scored_for_resume.items()
-        if v["score"] >= cutoff_score and v["stage"] == "coarse"
-    ]
-
-    print(f"\n[Stage2] Total scored JDs:      {len(all_scores_sorted)}")
-    print(f"[Stage2] Top-20% cutoff score:  {cutoff_score}  ({top_n} JDs)")
-    print(f"[Stage2] Fine evaluations queued: {len(to_fine)}\n")
+    print(f"\n[Stage2] Total scored JDs:           {stats['n']}")
+    print(f"[Stage2] Threshold (>= {FINE_SCORE_THRESHOLD}):{'':>13}{stats['threshold_count']} JD(s)")
+    print(f"[Stage2] Top {FINE_TOP_PERCENT:g}% (cutoff {stats['top_cutoff']}):{'':>5}{stats['top_count']} JD(s)")
+    print(f"[Stage2] Union → fine eval queued:   {len(to_fine)}\n")
 
     if to_fine:
         jd_lookup  = {jd["url"]: jd for jd in jds}
