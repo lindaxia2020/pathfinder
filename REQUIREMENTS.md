@@ -104,9 +104,9 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 
 | ID | Requirement Description | Status |
 |----|----------|------|
-| REQ-033 | **Stage 1 Pre-filter**: Use keyword overlap count (AI tech vocabulary) for quick filtering; JDs below threshold (4 words) are directly marked score=0 without calling LLM | `[x]` |
-| REQ-034 | **Stage 1 Coarse Screening**: Each Gemini call batch-processes 10 JDs, returning coarse scores 1-100 (minimum score 1; 0 is used only for pre-filter elimination), reducing API consumption | `[x]` |
-| REQ-035 | **Stage 2 Fine Evaluation**: For the top 20% of JDs by coarse score, call Gemini individually for detailed assessment (4 weighted dimensions) | `[x]` |
+| REQ-033 | ~~**Stage 1 Pre-filter**: Use keyword overlap count (AI tech vocabulary) for quick filtering; JDs below threshold (4 words) are directly marked score=0 without calling LLM~~ **OBSOLETE (P0-8, 2026-04-28)**: keyword pre-filter removed — it second-guessed `is_ai_tpm` classification with crude regex and produced false negatives on AI-native JDs that didn't repeat magic words. Stage 1 batch coarse scoring is now the first quantitative gate. PRJ-002 introduces a separate **ATS Coverage** dimension (REQ-101) that runs deterministically alongside Stage 1 — not a pre-filter. | `[x]` |
+| REQ-034 | **Stage 1 Coarse Screening**: Each Gemini call batch-processes 10 JDs, returning coarse scores 1-100 (minimum score 1), reducing API consumption. Renamed to "Recruiter Score" in PRJ-002 (REQ-105) — internal call shape unchanged. | `[x]` |
+| REQ-035 | **Stage 2 Fine Evaluation**: JDs entering fine eval are the UNION of (coarse score >= `MATCH_FINE_SCORE_THRESHOLD`, default 60) and (top `MATCH_FINE_TOP_PERCENT%` of run, default 60%). UNION semantics protect against both flat-high distributions (where top-N% would discard genuine fits) and flat-low ones (where the absolute threshold would select nothing). Updated 2026-04-28 (P0-9). Each candidate gets one Gemini call with 4 weighted dimensions. | `[x]` |
 | REQ-036 | Fine evaluation dimensions: AI/ML Technical Depth (30%), TPM Role Fit (30%), Industry Domain Relevance (20%), Growth Trajectory (20%) | `[x]` |
 | REQ-037 | Fine evaluation results include: compatibility score, key strengths list, key gaps list, recommendation rationale (honest assessment, no inflated scores) | `[x]` |
 | REQ-038 | Prefer reading JD Markdown from `jd_cache/` for fine evaluation; fall back to JD JSON fields if no cache exists | `[x]` |
@@ -144,7 +144,7 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 | REQ-049 | Load all match records from Match_Results with score >= 0 as optimization candidates | `[x]` |
 | REQ-050 | For each matched JD, use Gemini to tailor the resume (using only information from the original resume, no fabricated experience) | `[x]` |
 | REQ-051 | Tailored resumes are saved to `tailored_resumes/{resume_id}/{url_md5}.md`, organized by resume ID subdirectories | `[x]` |
-| REQ-052 | Re-score tailored resumes using the same `_FINE_SYSTEM_PROMPT` as Match Agent (4-dimension weighted scoring: AI Technical Depth 30% / TPM Fit 30% / Domain 20% / Growth 20%), with batch processing support (`batch_re_score`) | `[x]` |
+| REQ-052 | Re-score tailored resumes using the same `HM_SYSTEM_PROMPT` (formerly `FINE_SYSTEM_PROMPT`) as Match Agent (4-dimension weighted scoring: AI Technical Depth 30% / TPM Fit 30% / Domain 20% / Growth 20%). Per-JD single calls with `RESCORE_CONCURRENCY=3`; batch re-score removed in P0-10 (2026-04-28) because batch-context anchoring inflated Score Delta by ~3-5pt. PRJ-002 PR 4 adds Recruiter and ATS dimensions alongside (REQ-107). | `[x]` |
 | REQ-053 | Results are written to a new Excel worksheet `Tailored_Match_Results`, including original score, tailored score, delta, optimization summary, etc. | `[x]` |
 
 ### Incremental Updates
@@ -196,6 +196,59 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 
 ---
 
+## 9. PRJ-002: 3-Dimension Scoring Requirements
+
+**Project**: PRJ-002 — 3-Dimension Scoring (ATS / Recruiter / HM). See `docs/sdlc/PRJ-002-3d-scoring/` for BRD + tech design.
+
+**Motivation**: The single LLM-derived "fit score" did not map to the real North American hiring funnel (ATS keyword filter → recruiter quick scan → hiring manager deep dive). Score Delta after tailoring conflated keyword gains with semantic strength changes, leaving the user no signal on which one moved.
+
+### ATS Dimension (Deterministic)
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-100 | `JobDetails` Pydantic schema gains `ats_keywords: list[str]` field (default `[]`), populated by Gemini at JD ingest time. The extraction prompt instructs the model to emit 8-15 noun-phrase keywords (tools, frameworks, certifications, methodologies); excludes adjectives, generic verbs, and full sentences. | `[t]` |
+| REQ-101 | `shared/ats_matcher.py` provides `compute_coverage(keywords, resume_text) -> {percent, matched, missing, keyword_count}` with no LLM dependency and no new pip dependencies. Pure Python (~120 lines). | `[t]` |
+| REQ-102 | Matching is case-insensitive, applies a hand-rolled lightweight plural stem (`-ies` → y; `-sses` / `-xes` / `-ches` / `-shes` → strip `-es`; terminal `-s` (not `-ss`) → strip), and consults a hand-curated synonym table (~18 entries) at `shared/ats_synonyms.py`. Tokens with embedded `.` `+` `/` `#` `-` skip stemming (preserves `C++`, `C#`, `K8s`, `GPT-4`, `Node.js`). | `[t]` |
+| REQ-110 | ATS coverage `<30%` (configurable `ATS_COVERAGE_LOW_THRESHOLD`) surfaces as ⚠️ in the run summary; JDs are NOT dropped or excluded from fine eval (soft signal, not a hard gate). | `[t]` |
+
+### Excel Schema (3-Dimension Storage)
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-103 | `Match_Results` sheet gains `ATS Coverage %`, `Recruiter Score`, `HM Score`, `ATS Missing` columns. All legacy column indices preserved; new cols appended at end. | `[t]` |
+| REQ-104 | `Tailored_Match_Results` sheet gains 9 per-dim columns: Original / Tailored / Delta × {ATS, Recruiter, HM}. Legacy `Original Score` / `Tailored Score` / `Score Delta` mirror the HM dimension for back-compat. | `[t]` |
+| REQ-109 | `get_or_create_excel` auto-migrates old files: detects missing columns, appends them, leaves existing rows blank for new cols. Migration is idempotent (multiple calls don't duplicate columns). Old rows are populated by re-running `match_agent` / `resume_optimizer`. | `[t]` |
+
+### Prompt Naming
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-105 | `COARSE_SYSTEM_PROMPT` renamed to `RECRUITER_SYSTEM_PROMPT`; `FINE_SYSTEM_PROMPT` renamed to `HM_SYSTEM_PROMPT`. Pure rename — content byte-identical (`is`-equality preserved) so existing scores remain comparable across the rename. Old names retained as deprecated aliases for back-compat. | `[t]` |
+
+### Match Agent Integration
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-106 | Match agent computes ATS for **all pending JDs** (deterministic, no LLM cost). Recruiter (Stage 1) runs on **all pending JDs** unchanged. HM (Stage 2) gating retains the UNION-of-threshold-and-top-N% rule from REQ-035. ATS / Recruiter run on the same set; HM is a subset. | `[t]` |
+| REQ-111 | `batch_upsert_match_records` accepts dict records with optional per-dim keys (`ats_coverage_percent`, `recruiter_score`, `hm_score`, `ats_missing`). Key absent → preserve existing cell value (Stage 2 fine writes only `hm_score` and does not clobber Stage 1's ATS / Recruiter writes). Tuple-format records still supported (back-compat). | `[t]` |
+
+### Resume Optimizer Integration
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-107 | Resume optimizer rescores all 3 dimensions on each tailored resume: 1 deterministic ATS pass + 1 Recruiter Gemini call (via single-element `batch_coarse_score` batch) + 1 HM Gemini call (existing `re_score`). Per-dim deltas (ATS / Recruiter / HM) computed and persisted. | `[t]` |
+| REQ-108 | Regression flag = `(HM Delta < 0)` only. ATS / Recruiter drops do NOT trigger regression — a tailor that shifts emphasis away from a recruiter keyword while preserving HM fit is a valid trade-off. Regression precedence in `batch_upsert_tailored_records`: explicit `regression` field > `hm_delta` > legacy `score_delta` (back-compat fallback). | `[t]` |
+| REQ-112 | At least one regression test guards each design decision (D1-D5 in PRJ-002 status.md): ATS-as-parallel-dim (REQ-101), Gemini extracts `ats_keywords` (REQ-100), exact + stem + synonym matching (REQ-102), soft <30% flag (REQ-110), Coarse → Recruiter / Fine → HM rename (REQ-105). | `[t]` |
+
+> **Code location (REQ-100)**: `agents/job_agent.py` — `JobDetails` Pydantic class (line ~122), `extract_jd()` function (`_common_instr` block, line ~1310).
+> **Code location (REQ-101 / REQ-102 / REQ-110)**: `shared/ats_matcher.py`, `shared/ats_synonyms.py`, `shared/schemas.py` (`ATSCoverageResult`).
+> **Code location (REQ-103 / REQ-104 / REQ-109 / REQ-111)**: `shared/excel_store.py` — `MATCH_HEADERS`, `TAILORED_HEADERS`, `get_or_create_excel`, `batch_upsert_match_records`, `batch_upsert_tailored_records`, `get_scored_matches`.
+> **Code location (REQ-105)**: `shared/prompts.py` — `RECRUITER_SYSTEM_PROMPT`, `HM_SYSTEM_PROMPT`, deprecated aliases.
+> **Code location (REQ-106)**: `agents/match_agent.py` — `_extract_ats_keywords`, `compute_ats_for_jds`, `_main_inner` Stage 1 / 2 record assembly.
+> **Code location (REQ-107 / REQ-108)**: `agents/resume_optimizer.py` — `rescore_one` async function, Phase 3 record assembly. `_KEY_POOL` propagation into `match_agent` module enables the cross-agent Recruiter call.
+
+---
+
 ## 10. Technical Decision Record
 
 ### DEC-001: LLM Model Selection — Retain Gemini flash-lite (2026-03-16)
@@ -236,3 +289,4 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 | v1.6 | 2026-03-16 | REQ-060, REQ-061 verified and passed; status updated to `[x]`. REQ-060: Added `_assess_jd_quality()` function, added `Data Quality` column to `JD_HEADERS`, auto-migration for old files, integrated writes in `_process_scraped_jd` and `retry_one`. REQ-061: Workday regex changed to `(?:\.wd\d+)?` making wd prefix optional, URL construction dynamically extracts original host. All 54 related tests passed (21 + 8 + 24 + 1 regression). |
 | v1.7 | 2026-03-16 | Added "Architecture Extensibility (P3)" subsection. REQ-062 (ATS declarative routing table refactor, P3), REQ-063 (automatic archival of companies with no TPM jobs, P3, automated implementation of REQ-029). |
 | v1.8 | 2026-03-16 | REQ-062, REQ-063 verified and passed; status updated to `[x]`. REQ-062: Added `ATS_PLATFORMS` declarative routing table (6 entries: greenhouse/lever/ashby/workday/google/tesla), `_match_ats()` route matching function, `_resolve_list_fn()` and `_discover_via_api()` helper functions, `_JD_FN_REGISTRY` JD routing registry; `API_ATS`/`WORKDAY_ATS`/`CRAWLER_ATS` auto-derived from routing table; 9 `_match_ats` tests + 5 routing table integrity tests all passed. REQ-063: `shared/config.py` added `AUTO_ARCHIVE_THRESHOLD=3`; `shared/excel_store.py` added `No TPM Count`/`Auto Archived` columns, migration logic, `get_archived_companies`/`update_archive_status`/`unarchive_company`/`get_company_archive_info`/`count_valid_tpm_jobs_by_company` five functions; `agents/job_agent.py` main() skips archived companies before iteration, updates archive status by threshold after iteration, `data_quality=failed` records excluded from count; 28 related tests (11 job_agent + 16 excel_store + 5 count_valid) all passed. |
+| v1.9 | 2026-04-28 | Added "9. PRJ-002: 3-Dimension Scoring Requirements" section: REQ-100~112 covering ATS dimension (deterministic keyword coverage, REQ-100~102, REQ-110), Excel schema extensions (REQ-103, REQ-104, REQ-109, REQ-111), prompt rename pivot (REQ-105), match_agent integration (REQ-106), resume_optimizer integration (REQ-107~108), test coverage (REQ-112). Implemented across 5 sequential PRs (`feat/3d-scoring` branch). Tests: 619 → 718 (+99). Also updated REQ-033 (marked obsolete: keyword pre-filter removed in P0-8), REQ-035 (top 20% → UNION threshold/top-N% per P0-9), REQ-052 (renamed FINE_SYSTEM_PROMPT to HM_SYSTEM_PROMPT, dropped batch_re_score reference per P0-10). |

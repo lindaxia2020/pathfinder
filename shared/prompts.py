@@ -68,11 +68,15 @@ HM_SYSTEM_PROMPT = (
 
 
 # ── Back-compat aliases (PRJ-002 PR 2) ────────────────────────────────────────
-# Existing call sites import the old names. The aliases keep them working
-# byte-identically until PR 5 sweeps the imports across match_agent and
-# resume_optimizer. Removing these aliases is part of the PR 5 cleanup.
-COARSE_SYSTEM_PROMPT = RECRUITER_SYSTEM_PROMPT
-FINE_SYSTEM_PROMPT   = HM_SYSTEM_PROMPT
+# DEPRECATED. New code MUST use RECRUITER_SYSTEM_PROMPT / HM_SYSTEM_PROMPT.
+# These aliases remain because removing them would force a cross-cutting rename
+# of imports + identifiers in match_agent.py, resume_optimizer.py, and three
+# test files (>3 files = a separate dedicated PR per the project's task-size
+# rule). When that PR happens, delete these two lines and the references in
+# tests/test_shared_prompts.py::TestPromptSingleSource that assert via the
+# old names.
+COARSE_SYSTEM_PROMPT = RECRUITER_SYSTEM_PROMPT  # deprecated → RECRUITER_SYSTEM_PROMPT
+FINE_SYSTEM_PROMPT   = HM_SYSTEM_PROMPT          # deprecated → HM_SYSTEM_PROMPT
 
 
 TAILOR_SYSTEM_PROMPT = (

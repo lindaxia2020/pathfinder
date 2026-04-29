@@ -1,5 +1,44 @@
 # CHANGELOG
 
+## 2026-04-28
+
+### Major: 3-Dimension Scoring (PRJ-002)
+
+The resume-fit scoring pipeline is restructured from a single LLM-derived "fit score" into three parallel dimensions that each map to one real-world hiring filter:
+
+- **ATS Coverage** (deterministic keyword match, no LLM) — proxy for Applicant Tracking System / recruiter-keyword-search pass-through. Implemented in `shared/ats_matcher.py` (~120 lines, no new pip deps) with case-insensitive matching, lightweight plural stem (`-ies` / `-sses` / `-xes` / `-ches` / `-shes` / `-s`), and a hand-curated synonym table (~18 entries: GenAI≈Generative AI, K8s≈Kubernetes, LLM≈Large Language Model, etc.) in `shared/ats_synonyms.py`.
+- **Recruiter Score** (Gemini, was COARSE) — quick recruiter-style 1-100 scan; renamed for clarity.
+- **HM Score** (Gemini, was FINE) — hiring-manager 4-criteria deep evaluation (AI/ML Tech Depth 30% / TPM Function 30% / Domain 20% / Growth 20%); renamed for clarity.
+
+**New behavior**:
+- `agents/job_agent.py`: `JobDetails` extracts `ats_keywords: list[str]` (8-15 noun phrases) at JD ingest time.
+- `agents/match_agent.py`: ATS coverage runs deterministically before Stage 1 for every pending JD; Recruiter and HM dimensions retain existing call shapes. Coarse / fine records switch to dict format with optional per-dim fields.
+- `agents/resume_optimizer.py`: rescores all 3 dimensions after tailoring (1 deterministic ATS + 1 Recruiter Gemini + 1 HM Gemini per JD). Surfaces per-dimension delta so users can see ATS keyword gains separately from semantic strength changes.
+- **Regression flag now means `HM Delta < 0` only** (was: legacy single-score delta < 0). ATS / Recruiter drops are informational — a tailor that shifts emphasis away from a recruiter keyword while preserving HM fit is fine and should NOT push the user to keep the base resume.
+
+**Excel schema changes** (auto-migrated, backward compatible):
+- `Match_Results`: +4 columns (ATS Coverage %, Recruiter Score, HM Score, ATS Missing). All legacy column indices preserved.
+- `Tailored_Match_Results`: +9 columns (per-dim Original / Tailored / Delta × {ATS, Recruiter, HM}). Legacy `Original Score` / `Tailored Score` / `Score Delta` mirror the HM dimension for back-compat.
+- Old rows: blank values for new cols. Re-run match_agent / optimizer to populate.
+- `batch_upsert_match_records` and `batch_upsert_tailored_records` accept dict records with optional per-dim keys; key absent → preserve cell. Tuple-format records still supported for back-compat.
+
+**Prompt rename pivot** (pure rename, content byte-identical):
+- `COARSE_SYSTEM_PROMPT` → `RECRUITER_SYSTEM_PROMPT` (back-compat alias retained)
+- `FINE_SYSTEM_PROMPT` → `HM_SYSTEM_PROMPT` (back-compat alias retained)
+
+**Cost impact**: Resume Optimizer adds 1 Recruiter Gemini call per tailored JD (was: 1 tailor + 1 HM rescore; now: 1 tailor + 1 Recruiter + 1 HM). At 13 RPM shared rate limit, 10 tailored JDs takes ~45s extra. ATS dimension is deterministic — zero API cost.
+
+**Reference docs**: `docs/sdlc/PRJ-002-3d-scoring/` (BRD + tech design + status).
+
+**Tests**: 619 → 718 (+99 across 5 sequential PRs), all passing.
+
+### P0 Code Review Follow-ups
+
+- **P0-9** (`6e9267f`): Stage 2 fine candidate selection switched from "top 20%" to UNION of (score >= `MATCH_FINE_SCORE_THRESHOLD`, top `MATCH_FINE_TOP_PERCENT%`). Protects against both flat-high distributions (where top-N% would discard genuine fits) and flat-low ones (where the absolute threshold would select nothing).
+- **P0-10** (`43bb666`): Optimizer rescore call shape unified with match_agent's fine eval. Dropped batch re-score (5 pairs/call) in favor of per-JD calls with `RESCORE_CONCURRENCY=3`. Eliminates ~3-5pt batch-context anchoring inflation in Score Delta. Removed unused `BATCH_FINE_SYSTEM_PROMPT` / `BatchMatchItem` / `BatchMatchResult`.
+- **P0-11** (`b88ab9a`): Gemini transient errors (5xx / UNAVAILABLE / timeout) now retry on the same key with bounded exponential backoff (2s / 4s / 8s + jitter) before raising. Quota / 429 still rotates keys (key-specific). Aligns with Gemini API guidance for retryable server-side errors.
+- **P0-12** (`712cd0e`): `Tailored_Match_Results` gains a persisted `Regression` boolean column. Previously this signal was only printed at run time and lost between runs; users had to re-derive from Score Delta < 0.
+
 ## 2026-03-17
 
 ### Rename: Simplified Excel Tab Names (Removed Redundant "AI_" Prefix)

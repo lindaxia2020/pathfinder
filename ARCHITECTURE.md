@@ -103,7 +103,14 @@ On completion: Update TPM Jobs / AI TPM Jobs counts in Company_List for each com
 ### 3.3 Match Agent (`agents/match_agent.py`)
 
 **Run frequency**: After each resume update
-**Responsibilities**: Two-stage matching and scoring of all AI TPM JDs against the candidate's resume
+**Responsibilities**: Score all AI TPM JDs against the candidate's resume on three parallel dimensions (PRJ-002).
+
+**Three scoring dimensions** (PRJ-002 / 2026-04-28):
+| Dimension | Source | Cost | Maps to real-world filter |
+|---|---|---|---|
+| ATS Coverage % | Deterministic keyword match (`shared/ats_matcher.py`) | Free, no LLM | ATS / recruiter keyword search pass-through |
+| Recruiter Score (1-100) | Gemini, `RECRUITER_SYSTEM_PROMPT` (was COARSE) | 1 batch call per 10 JDs | Recruiter 30-second resume scan |
+| HM Score (1-100) | Gemini, `HM_SYSTEM_PROMPT` (was FINE), 4 weighted criteria | 1 single call per JD | Hiring manager deep evaluation |
 
 **Internal flow**:
 ```
@@ -111,51 +118,81 @@ On completion: Update TPM Jobs / AI TPM Jobs counts in Company_List for each com
 2. Read all JDs from JD_Tracker where is_ai_tpm=True
 3. Detect stale pairs (resume hash changed) → mark for re-scoring
 
-Stage 1 — Coarse screening:
-  Pre-filter: keyword overlap < 4 → score=0, write coarse record, skip Gemini
-  Batch scoring: each Gemini call processes 10 JDs → returns 0-100 coarse score
-  Results written to Match_Results (stage=coarse)
+ATS dim (PRJ-002, runs first, no LLM):
+  → For each pending JD: parse ats_keywords from cached JobDetails JSON
+  → compute_coverage(ats_keywords, resume_text) → {percent, matched, missing}
+  → Coverage <30% prints with ⚠️ marker (soft signal, JD NOT dropped)
 
-Stage 2 — Fine evaluation (Top 20%):
-  Sort by coarse score, take Top 20% where stage=coarse
-  Concurrent fine evaluation (max 3 concurrent, 13 RPM rate limit):
+Stage 1 — Recruiter scoring:
+  Batch scoring: each Gemini call processes 10 JDs → returns 1-100 score
+  Records written as dicts to Match_Results with stage=coarse and per-dim
+  values populated (ATS Coverage %, Recruiter Score, HM Score=None)
+
+Stage 2 — HM evaluation (UNION of threshold + top-N%):
+  Selection = (score >= MATCH_FINE_SCORE_THRESHOLD, default 60) ∪
+              (top MATCH_FINE_TOP_PERCENT% of run, default 60%)
+  Concurrent evaluation (max 3 concurrent, 13 RPM rate limit):
     → Prefer reading Markdown from jd_cache/, otherwise use JD JSON
     → Gemini scores on 4 weighted dimensions (AI tech depth 30% / TPM fit 30% / Domain 20% / Growth 20%)
-    → Results include: score/strengths/gaps/recommendation reason (stage=fine)
-  Batch upsert to Match_Results
+    → Results include: score / strengths / gaps / recommendation reason
+  Records written with stage=fine and ONLY hm_score key — the upsert's
+  "key absent → preserve" semantic keeps Stage 1's ATS / Recruiter values intact
 
-4. Console outputs Top 5 matches (★=fine eval / ~=coarse)
+4. Console outputs Top 5 matches (★=HM evaluated / ~=Recruiter only)
 ```
 
-**AI technology keyword pool** (for pre-filtering):
-`llm, gpt, genai, transformer, pytorch, cuda, gpu, inference, mlops, rag, vector, ...`
+**Key constants**:
+- `ATS_COVERAGE_LOW_THRESHOLD = 30.0` — soft ⚠️ flag threshold for ATS dim
+- `MATCH_FINE_SCORE_THRESHOLD = 60` (env-overridable) — absolute gate for HM eval
+- `MATCH_FINE_TOP_PERCENT = 60.0` (env-overridable) — relative gate for HM eval
 
 ---
 
 ### 3.4 Resume Optimizer Agent (`agents/resume_optimizer.py`)
 
 **Run frequency**: After Match Agent completes
-**Responsibilities**: Tailor and rewrite the resume for each matched JD, re-score to verify improvement
+**Responsibilities**: Tailor the resume for each matched JD, re-score on all 3 dimensions to verify improvement (PRJ-002).
 
 **Internal flow**:
 ```
 1. Load resume from profile/, compute MD5
-2. Read all match records from Match_Results where score >= 0
-3. Read existing optimized records from Tailored_Match_Results, skip pairs where resume_hash is unchanged
-4. Batch process each (resume_id, jd_url, original_score):
-   ├── Load JD content (jd_cache structured.md preferred → raw.md → JD JSON)
-   ├── Gemini Call 1: Generate tailored resume (reorganize/rewrite only, no fabricating experience)
-   ├── Save to tailored_resumes/{resume_id}/{url_md5}.md
-   ├── Gemini Call 2: Re-score using the same _FINE_SYSTEM_PROMPT
-   └── Collect result records
-5. Batch write to Tailored_Match_Results sheet
-6. Console outputs summary table sorted by Score Delta
+2. Read fine-stage matches from Match_Results (stage="fine"), including
+   per-dim originals (ATS Coverage %, Recruiter Score, HM Score) via the
+   PR 4 extension to get_scored_matches
+3. Read existing optimized records from Tailored_Match_Results, skip pairs
+   where resume_hash is unchanged
+
+Phase 1 — Batch tailor:
+  Batch size 2 — Gemini generates tailored resume (reorders / emphasizes /
+  mirrors JD keywords; never fabricates new experience). Save to
+  tailored_resumes/{resume_id}/{url_md5}.md. Per-item fallback if batch failed.
+
+Phase 2 — 3-dimension rescore (per JD, concurrency=3):
+  ├── ATS:       compute_coverage(ats_keywords, tailored_md) — deterministic, no LLM
+  ├── Recruiter: batch_coarse_score(tailored_md, [jd_dict]) — 1 Gemini call (cross-agent)
+  └── HM:        re_score(tailored_md, jd_content) — 1 Gemini call, FINE_SYSTEM_PROMPT
+  Per-JD prints: ATS o→t (Δ) | Rec o→t (Δ) | HM o→t (Δ)
+
+Phase 3 — Assemble + write:
+  9 per-dim record keys + legacy mirroring (Original Score = Original HM, etc.)
+  Regression flag = (HM Delta < 0) only — ATS / Recruiter drops are info,
+  not regressions (REQ-108)
+  Batch upsert to Tailored_Match_Results
+
+4. Console outputs summary table sorted by Score Delta
 ```
 
+**Cost model** (per N tailored JDs):
+- Tailor: ⌈N/2⌉ Gemini batch calls + per-item fallbacks
+- Recruiter rescore: N Gemini calls (1 per JD)
+- HM rescore: N Gemini calls (1 per JD)
+- ATS rescore: 0 calls (deterministic)
+- Total: ~2.5N Gemini calls, where pre-PRJ-002 was ~1.5N
+
 **Concurrency model**:
-- Batch processing mode: `BATCH_TAILOR_SIZE=2` (tailor) / `BATCH_RESCORE_SIZE=5` (re-score)
-- `_RateLimiter(rpm=13)` shared rate limiter
-- Sequential execution between batches, no `asyncio.Semaphore`
+- `BATCH_TAILOR_SIZE=2` (tailor batches), `RESCORE_CONCURRENCY=3` (rescore concurrent)
+- `_RateLimiter(rpm=13)` shared rate limiter (across both Recruiter and HM Phase 2 calls)
+- Cross-agent key pool sharing: optimizer's `main` propagates `_KEY_POOL` into the `match_agent` module so `batch_coarse_score` (used for Recruiter rescore) has a pool
 
 ---
 
@@ -170,8 +207,8 @@ Stage 2 — Fine evaluation (Top 20%):
 | `Company_List` | Company Name | Company Name, AI Domain, Business Focus, Career URL, Updated At, TPM Jobs, AI TPM Jobs, No TPM Count, Auto Archived |
 | `Company_Without_TPM` | Company Name | Company Name, AI Domain, Business Focus, Career URL, Updated At, TPM Jobs, AI TPM Jobs |
 | `JD_Tracker` | JD URL | JD URL, Job Title, Company, Location, Salary, Requirements, Additional Qualifications, Responsibilities, Is AI TPM, Updated At, MD Hash, Data Quality |
-| `Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Score, Strengths, Gaps, Reason, Updated At, Resume Hash, Stage |
-| `Tailored_Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Job Title, Company, Original Score, Tailored Score, Score Delta, Tailored Resume Path, Optimization Summary, Updated At, Resume Hash |
+| `Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Score, Strengths, Gaps, Reason, Updated At, Resume Hash, Stage, **ATS Coverage %, Recruiter Score, HM Score, ATS Missing** (PRJ-002) |
+| `Tailored_Match_Results` | Resume ID + JD URL | Resume ID, JD URL, Job Title, Company, Original Score, Tailored Score, Score Delta, Tailored Resume Path, Optimization Summary, Updated At, Resume Hash, Regression, **Original ATS, Tailored ATS, ATS Delta, Original Recruiter, Tailored Recruiter, Recruiter Delta, Original HM, Tailored HM, HM Delta** (PRJ-002) |
 
 ### Key Design
 
@@ -352,4 +389,5 @@ pathfinder/
 | v1.2 | 2026-03-16 | Added development tool layer: 7 Custom Agents (product-manager, agent-reviewer, schema-validator, test-analyzer, api-debugger, doc-sync, bug-tracker) + 5 Skills (pipeline, run-agent, test-all, test-one, check-env). Architecture document added Section 6 "Development Tool Layer". | Establish AI-assisted development cycle: Planning layer (PM) → Quality layer (6 analysis agents) → Operations layer (5 execution skills), with TPM as sole decision maker |
 | v1.3 | 2026-03-16 | Added coordination layer: TPM Agent (opus) + 3 SDLC Skills (sdlc-init, sdlc-status, sdlc-review) + `docs/sdlc/` project document directory. PM Agent gained BRD writing and testing sign-off modes. Established 5-phase SDLC workflow (BRD → Design → Implement → Testing → Launch). | Simulate real team SDLC: User only provides high-level goals, PM, TPM, Engineer Lead, and QA Team collaborate to complete the full process from requirements to launch; document-driven inter-agent communication |
 | v1.4 | 2026-03-16 | Comprehensive code audit fixing 55 bugs (BUG-01~55); Job Agent enhancements: Ashby upgraded to API_ATS (REQ-058), soft 404 hardening + JD positive validation (REQ-059), JD field completeness grading (REQ-060), Workday URL format expansion (REQ-061); ATS declarative routing table refactoring (REQ-062); auto-archiving companies with no TPM positions (REQ-063); `shared/gemini_pool.py` refactored to unified base class (`_GeminiKeyPoolBase`) with client caching, round-robin rotation, thread safety; `shared/excel_store.py` added `_JD_COL` dynamic column mapping and 5 archive management functions; JD_Tracker schema added Requirements/Additional Qualifications/Data Quality columns; Company_List added No TPM Count/Auto Archived columns. Tests grew from ~120 to 485. | Comprehensive code quality and robustness improvement; ATS extensibility; data quality observability |
-| v1.5 (current) | 2026-03-17 | Added Observability Agent (run reporting, quality drift detection, anomaly alerting) and Cost Agent (token usage estimation, quota monitoring, cost optimization recommendations). Custom Agents grew from 9 to 11. | Runtime quality monitoring and cost governance capabilities specific to AI projects, filling gaps in traditional SDLC for AI dimensions |
+| v1.5 | 2026-03-17 | Added Observability Agent (run reporting, quality drift detection, anomaly alerting) and Cost Agent (token usage estimation, quota monitoring, cost optimization recommendations). Custom Agents grew from 9 to 11. | Runtime quality monitoring and cost governance capabilities specific to AI projects, filling gaps in traditional SDLC for AI dimensions |
+| v1.6 (current) | 2026-04-28 | **PRJ-002: 3-Dimension Scoring**. Restructured the resume-fit scoring pipeline from a single LLM-derived "fit score" into three parallel dimensions: ATS Coverage (deterministic, `shared/ats_matcher.py`), Recruiter Score (Gemini, was COARSE), HM Score (Gemini, was FINE). New `JobDetails.ats_keywords` field; `Match_Results` +4 cols; `Tailored_Match_Results` +9 cols (auto-migrated). Optimizer rescores all 3 dims; regression flag now means HM Delta < 0 only (was: legacy single-score delta). Tests 619 → 718 (+99 across 5 sequential PRs). Plus P0 follow-ups: P0-9 Stage 2 UNION selection, P0-10 single-JD rescore parity, P0-11 Gemini transient backoff retry, P0-12 persisted Regression column. | Existing single-score Score Delta conflated keyword gains with semantic strength; users had no signal on which one moved. Mapping each dimension to one real-world hiring filter (ATS keyword search → recruiter scan → HM deep eval) makes the system's output match the actual North American funnel. |
