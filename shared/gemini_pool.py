@@ -1,8 +1,16 @@
 """Shared Gemini API key pool with auto-rotation on quota exhaustion."""
 import logging
+import random
 import threading
+import time
 
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
+
+# Backoff for non-quota transient errors (5xx / UNAVAILABLE / timeout). The
+# Gemini API explicitly tells callers to retry on 503; a single overload spike
+# would otherwise abort the whole run. Quota/429 stays on the key-rotation
+# path — it's key-specific, not server-wide, so backoff there is wasted.
+_TRANSIENT_RETRY_BACKOFFS = (2.0, 4.0, 8.0)  # seconds; jitter added at use site
 
 
 # Substrings (case-insensitive) that mark a transient (server / quota) error
@@ -70,11 +78,13 @@ class _GeminiKeyPoolBase:
 
         Classifies failures (P0-4):
           * Quota / 429 → rotate keys; raise GeminiTransientError if all exhausted.
-          * Other transient (5xx, timeout) → raise GeminiTransientError immediately.
+          * Other transient (5xx, timeout) → bounded exponential backoff retry,
+            then raise GeminiTransientError if still failing.
           * Anything else (JSON parse, content filter, schema) → raise
             GeminiStructuralError so the caller drops the record.
         """
         tried_count = 0
+        transient_attempt = 0
         while True:
             with self._lock:
                 gc = self._get_client(genai_mod)
@@ -91,8 +101,18 @@ class _GeminiKeyPoolBase:
                             logging.error("[KeyPool] All Gemini API keys exhausted.")
                             raise GeminiTransientError(f"All Gemini keys quota exhausted: {err}") from e
                     continue
-                # Other transient errors: don't rotate (not key-specific), fail loudly.
+                # Server-side transient (5xx / UNAVAILABLE / timeout): retry on
+                # the same key with bounded exponential backoff before failing.
                 if _is_transient(err):
+                    if transient_attempt < len(_TRANSIENT_RETRY_BACKOFFS):
+                        delay = _TRANSIENT_RETRY_BACKOFFS[transient_attempt] + random.uniform(0, 0.5)
+                        transient_attempt += 1
+                        logging.warning(
+                            f"[KeyPool] Transient error (attempt {transient_attempt}/"
+                            f"{len(_TRANSIENT_RETRY_BACKOFFS)}); retrying in {delay:.1f}s: {err}"
+                        )
+                        time.sleep(delay)
+                        continue
                     raise GeminiTransientError(err) from e
                 # Everything else is structural — caller should drop the record.
                 raise GeminiStructuralError(err) from e
