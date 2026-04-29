@@ -576,15 +576,14 @@ class TestResumeOptimizerMain(unittest.IsolatedAsyncioTestCase):
                 for i in range(len(jd_contents))
             ]
 
-        # Mock batch_re_score to return improved scores
-        def fake_batch_re_score(pairs):
-            return [
-                {"compatibility_score": 85,
-                 "key_strengths": ["Improved alignment"],
-                 "critical_gaps": [],
-                 "recommendation_reason": "Better match after tailoring."}
-                for _ in pairs
-            ]
+        # Mock re_score (single-call, FINE_SYSTEM_PROMPT) to return improved scores
+        def fake_re_score(tailored_resume, jd_content):
+            return json.dumps({
+                "compatibility_score": 85,
+                "key_strengths": ["Improved alignment"],
+                "critical_gaps": [],
+                "recommendation_reason": "Better match after tailoring.",
+            })
 
         tailored_dir = tempfile.mkdtemp()
         try:
@@ -592,7 +591,7 @@ class TestResumeOptimizerMain(unittest.IsolatedAsyncioTestCase):
                  patch("agents.resume_optimizer.PROFILE_DIR", self.profile_dir), \
                  patch("agents.resume_optimizer.TAILORED_DIR", tailored_dir), \
                  patch("agents.resume_optimizer.batch_tailor_resume", side_effect=fake_batch_tailor), \
-                 patch("agents.resume_optimizer.batch_re_score", side_effect=fake_batch_re_score), \
+                 patch("agents.resume_optimizer.re_score", side_effect=fake_re_score), \
                  patch("agents.resume_optimizer._load_jd_markdown", return_value="# Fake JD content"):
 
                 await optimizer_mod.main()

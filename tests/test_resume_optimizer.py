@@ -41,12 +41,10 @@ from shared.schemas import (
     MatchResult,
     BatchTailoredItem,
     BatchTailoredResult,
-    BatchMatchItem,
-    BatchMatchResult,
 )
 from agents.resume_optimizer import (
     BATCH_TAILOR_SIZE,
-    BATCH_RESCORE_SIZE,
+    RESCORE_CONCURRENCY,
     load_resume,
     _load_jd_markdown,
     _save_tailored_resume,
@@ -54,7 +52,6 @@ from agents.resume_optimizer import (
     tailor_resume,
     re_score,
     batch_tailor_resume,
-    batch_re_score,
     _GeminiKeyPool,
 )
 from shared.excel_store import TAILORED_HEADERS
@@ -254,22 +251,9 @@ class TestBatchSchemas(unittest.TestCase):
         self.assertEqual(result.items[0].index, 0)
         self.assertIn("R0", result.items[0].tailored_resume_markdown)
 
-    def test_batch_match_result_valid(self):
-        raw = json.dumps({
-            "items": [
-                {"index": 0, "compatibility_score": 80, "key_strengths": ["a"],
-                 "critical_gaps": ["b"], "recommendation_reason": "ok"},
-                {"index": 1, "compatibility_score": 60, "key_strengths": ["c"],
-                 "critical_gaps": ["d"], "recommendation_reason": "meh"},
-            ]
-        })
-        result = BatchMatchResult.model_validate_json(raw)
-        self.assertEqual(len(result.items), 2)
-        self.assertEqual(result.items[1].compatibility_score, 60)
-
     def test_batch_constants(self):
         self.assertGreater(BATCH_TAILOR_SIZE, 0)
-        self.assertGreater(BATCH_RESCORE_SIZE, 0)
+        self.assertGreater(RESCORE_CONCURRENCY, 0)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -337,71 +321,6 @@ class TestBatchTailorResume(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-class TestBatchReScore(unittest.TestCase):
-
-    def setUp(self):
-        self.mock_pool = MagicMock()
-        optimizer_mod._KEY_POOL = self.mock_pool
-
-    def tearDown(self):
-        optimizer_mod._KEY_POOL = None
-
-    def test_returns_aligned_results(self):
-        self.mock_pool.generate_content.return_value = MagicMock(
-            text=json.dumps({
-                "items": [
-                    {"index": 0, "compatibility_score": 85, "key_strengths": ["a"],
-                     "critical_gaps": ["b"], "recommendation_reason": "good"},
-                    {"index": 1, "compatibility_score": 70, "key_strengths": ["c"],
-                     "critical_gaps": ["d"], "recommendation_reason": "ok"},
-                ]
-            })
-        )
-        pairs = [
-            {"tailored_resume": "r0", "jd_content": "jd0"},
-            {"tailored_resume": "r1", "jd_content": "jd1"},
-        ]
-        results = batch_re_score(pairs)
-        self.assertEqual(len(results), 2)
-        self.assertEqual(results[0]["compatibility_score"], 85)
-        self.assertEqual(results[1]["compatibility_score"], 70)
-
-    def test_returns_empty_dicts_on_structural_error(self):
-        """P0-4: structural errors yield empty-dict sentinel, never fake compatibility_score=0."""
-        from shared.exceptions import GeminiStructuralError
-        self.mock_pool.generate_content.side_effect = GeminiStructuralError("bad")
-        pairs = [{"tailored_resume": "r0", "jd_content": "jd0"}]
-        results = batch_re_score(pairs)
-        self.assertEqual(results, [{}])
-
-    def test_reraises_transient_error(self):
-        from shared.exceptions import GeminiTransientError
-        self.mock_pool.generate_content.side_effect = GeminiTransientError("429")
-        with self.assertRaises(GeminiTransientError):
-            batch_re_score([{"tailored_resume": "r", "jd_content": "j"}])
-
-    def test_missing_index_gets_empty_dict(self):
-        """P0-4: index missing from Gemini response yields empty-dict sentinel,
-        not a fake compatibility_score=0. Caller routes empty dicts to the
-        per-item fallback path."""
-        self.mock_pool.generate_content.return_value = MagicMock(
-            text=json.dumps({
-                "items": [
-                    {"index": 1, "compatibility_score": 90, "key_strengths": [],
-                     "critical_gaps": [], "recommendation_reason": "great"},
-                ]
-            })
-        )
-        pairs = [
-            {"tailored_resume": "r0", "jd_content": "jd0"},
-            {"tailored_resume": "r1", "jd_content": "jd1"},
-        ]
-        results = batch_re_score(pairs)
-        self.assertEqual(results[0], {})
-        self.assertEqual(results[1]["compatibility_score"], 90)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 class TestGeminiKeyPool(unittest.TestCase):
 
     def test_initial_key(self):
@@ -452,14 +371,6 @@ class TestBug48ListComprehension(unittest.TestCase):
         source = inspect.getsource(batch_tailor_resume)
         self.assertNotIn("[{}] *", source.replace(" ", "").replace("\t", ""),
                          "batch_tailor_resume must not use [{}]*N")
-
-    def test_batch_re_score_uses_comprehension(self):
-        import inspect
-        source = inspect.getsource(batch_re_score)
-        # Check that the dict literal * pattern is not used
-        self.assertIn("for _ in range", source,
-                      "batch_re_score must use list comprehension")
-
 
 class TestBug50PrintSummaryDynamicColumns(unittest.TestCase):
     """BUG-50: _print_summary must use TAILORED_HEADERS for column lookup."""
@@ -515,6 +426,26 @@ class TestBug50PrintSummaryDynamicColumns(unittest.TestCase):
             os.unlink(xlsx_path)
 
 
+class TestRegressionFlagAssembly(unittest.TestCase):
+    """Optimizer's Phase 3 assembly must include `regression = delta < 0`
+    in the record dict that goes to batch_upsert_tailored_records.
+
+    Mirrors the source pattern:
+        regression = delta < 0
+        results.append({..., "regression": regression})
+    """
+
+    def test_negative_delta_marks_regression_true(self):
+        """When tailored < base, the assembled record must have regression=True."""
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        # Source-level guard: the regression key must be passed in the record dict.
+        self.assertIn('"regression": regression', src,
+                      "_main_inner must include regression flag in tailored record")
+        self.assertIn("regression = delta < 0", src,
+                      "_main_inner must compute regression from score delta")
+
+
 class TestBug54KeyPoolNoneGuard(unittest.TestCase):
     """BUG-54: Functions using _KEY_POOL must raise RuntimeError when pool is None."""
 
@@ -548,12 +479,12 @@ class TestBug54KeyPoolNoneGuard(unittest.TestCase):
         finally:
             optimizer_mod._KEY_POOL = original
 
-    def test_batch_re_score_raises_when_pool_none(self):
+    def test_re_score_raises_when_pool_none(self):
         original = optimizer_mod._KEY_POOL
         try:
             optimizer_mod._KEY_POOL = None
             with self.assertRaises(RuntimeError) as ctx:
-                batch_re_score([{"tailored_resume": "r", "jd_content": "j"}])
+                re_score("resume", "jd")
             self.assertIn("_KEY_POOL not initialized", str(ctx.exception))
         finally:
             optimizer_mod._KEY_POOL = original

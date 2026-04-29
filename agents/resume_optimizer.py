@@ -34,13 +34,12 @@ from shared.config import MODEL
 from shared.exceptions import GeminiTransientError, GeminiStructuralError
 from shared.run_summary import RunSummary
 from shared.prompts import (
-    FINE_SYSTEM_PROMPT, BATCH_FINE_SYSTEM_PROMPT,
+    FINE_SYSTEM_PROMPT,
     TAILOR_SYSTEM_PROMPT, BATCH_TAILOR_SYSTEM_PROMPT,
 )
 from shared.schemas import (
     MatchResult, TailoredResume,
     BatchTailoredItem, BatchTailoredResult,
-    BatchMatchItem, BatchMatchResult,
 )
 
 # BUG-41: single shared limiter for all Gemini calls
@@ -65,7 +64,7 @@ _KEY_POOL: "_GeminiKeyPool | None" = None
 # ── Prompts: see shared/prompts.py ────────────────────────────────────────────
 
 BATCH_TAILOR_SIZE = 2   # JDs per batch for tailor (output is large — full Markdown resume each)
-BATCH_RESCORE_SIZE = 5  # pairs per batch for re-score (output is small — scores + short text)
+RESCORE_CONCURRENCY = 3  # parallel single-JD re-score calls (matches match_agent's fine eval)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -189,54 +188,6 @@ def batch_tailor_resume(resume_text: str, jd_contents: list[str]) -> list[dict]:
     except Exception as e:
         logging.error(f"Batch tailor response parse failed (skipping {len(jd_contents)} jobs): {e}")
         return [{} for _ in range(len(jd_contents))]
-
-
-def batch_re_score(pairs: list[dict]) -> list[dict]:
-    """Batch re-score multiple (tailored_resume, jd_content) pairs. Returns list[dict] aligned to input."""
-    if _KEY_POOL is None:
-        raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking batch_re_score()")
-    numbered = "\n\n".join(
-        f"[PAIR {i}]\n"
-        "--- CANDIDATE PROFILE ---\n"
-        f"<scraped_content>\n{p['tailored_resume']}\n</scraped_content>\n\n"
-        "--- TARGET JD ---\n"
-        f"<scraped_content>\n{p['jd_content']}\n</scraped_content>"
-        for i, p in enumerate(pairs)
-    )
-    cfg = types.GenerateContentConfig(
-        system_instruction=BATCH_FINE_SYSTEM_PROMPT,
-        temperature=0.0,
-        response_mime_type="application/json",
-        response_schema=BatchMatchResult,
-    )
-    try:
-        resp = _KEY_POOL.generate_content(
-            model=MODEL,
-            contents=(f"{numbered}\n\nProvide BatchMatchResult JSON with one item per pair."),
-            config=cfg,
-        )
-        result = BatchMatchResult.model_validate_json(resp.text)
-        # P0-4: missing items stay as {} (sentinel for "no real score") so the
-        # caller can route them to the per-item fallback path. Previous code
-        # used {"compatibility_score": 0} which silently wrote a fake 0.
-        out: list[dict] = [{} for _ in range(len(pairs))]
-        for item in result.items:
-            if 0 <= item.index < len(pairs):
-                out[item.index] = {
-                    "compatibility_score": item.compatibility_score,
-                    "key_strengths": item.key_strengths,
-                    "critical_gaps": item.critical_gaps,
-                    "recommendation_reason": item.recommendation_reason,
-                }
-        return out
-    except GeminiTransientError:
-        raise
-    except GeminiStructuralError as e:
-        logging.error(f"Batch re-score structural failure (skipping {len(pairs)} pairs): {e}")
-        return [{} for _ in range(len(pairs))]
-    except Exception as e:
-        logging.error(f"Batch re-score response parse failed (skipping {len(pairs)} pairs): {e}")
-        return [{} for _ in range(len(pairs))]
 
 
 def re_score(tailored_resume: str, jd_content: str) -> str | None:
@@ -444,58 +395,45 @@ async def _main_inner(summary: RunSummary):
 
     print(f"\n[Phase 1 done] {len(tailor_results)}/{len(job_items)} resumes tailored.")
 
-    # ── Phase 2: Batch Re-score ────────────────────────────────────
+    # ── Phase 2: Re-score (single JD/call, FINE_SYSTEM_PROMPT) ─────
+    # Mirrors agents/match_agent.py:411-448 so original fine score and
+    # tailored re-score share the same call shape — Score Delta then
+    # reflects the resume change, not batch-context anchoring.
     rescore_items = [item for item in job_items if item["url"] in tailor_results]
-    n_rescore_batches = math.ceil(len(rescore_items) / BATCH_RESCORE_SIZE) if rescore_items else 0
-    print(f"\n[Phase 2] Batch re-scoring {len(rescore_items)} items in {n_rescore_batches} batches "
-          f"(batch_size={BATCH_RESCORE_SIZE})...\n")
+    print(f"\n[Phase 2] Re-scoring {len(rescore_items)} tailored resumes "
+          f"(1 JD/call, FINE_SYSTEM_PROMPT)...\n")
 
     score_results: dict[str, dict] = {}   # url -> score data dict
-    score_fallback: list[dict] = []
+    sem = asyncio.Semaphore(RESCORE_CONCURRENCY)
 
-    for b in range(n_rescore_batches):
-        batch = rescore_items[b * BATCH_RESCORE_SIZE : (b + 1) * BATCH_RESCORE_SIZE]
-        pairs = [
-            {
-                "tailored_resume": tailor_results[item["url"]]["tailored_md"],
-                "jd_content": item["jd_content"],
-            }
-            for item in batch
-        ]
-
-        labels = ", ".join(
-            f"{item['meta'].get('company', '?')}" for item in batch
-        )
-        print(f"  [Re-score {b+1}/{n_rescore_batches}] {labels}")
-
-        await limiter.acquire()
-        batch_scores = await asyncio.to_thread(batch_re_score, pairs)
-
-        for item, score_data in zip(batch, batch_scores):
-            if score_data.get("compatibility_score", 0) > 0:
-                score_results[item["url"]] = score_data
-            else:
-                score_fallback.append(item)
-
-    # ── Phase 2.5: Fallback — retry failed re-scores individually ──
-    if score_fallback:
-        print(f"\n  [Fallback] Retrying {len(score_fallback)} failed re-score items individually...")
-        for item in score_fallback:
+    async def rescore_one(item: dict, idx: int, total: int) -> None:
+        async with sem:
             url = item["url"]
+            company = item["meta"].get("company", "?")
             await limiter.acquire()
             score_json = await asyncio.to_thread(
                 re_score, tailor_results[url]["tailored_md"], item["jd_content"]
             )
             # P0-4: None = structural error; drop the record (do not write fake score=0).
             if score_json is None:
-                logging.error(f"  Fallback re-score failed for {url} (structural); dropping record.")
+                logging.error(f"  [Re-score {idx}/{total}] {company} — structural error, dropped")
                 summary.structural_errors += 1
-                continue
+                return
             try:
-                score_results[url] = json.loads(score_json)
+                parsed = json.loads(score_json)
             except Exception as e:
-                logging.error(f"  Fallback re-score parse failed for {url}: {e}; dropping record.")
+                logging.error(f"  [Re-score {idx}/{total}] {company} — parse failed: {e}; dropped")
                 summary.structural_errors += 1
+                return
+            score_results[url] = parsed
+            score = parsed.get("compatibility_score", 0)
+            print(f"  [Re-score {idx}/{total}] {company} — {score}/100")
+
+    if rescore_items:
+        total = len(rescore_items)
+        await asyncio.gather(*[
+            rescore_one(it, i, total) for i, it in enumerate(rescore_items, 1)
+        ])
 
     # ── Phase 3: Assemble results + write Excel ────────────────────
     results: list[dict] = []
@@ -510,9 +448,11 @@ async def _main_inner(summary: RunSummary):
         original_score = match["score"]
         delta = tailored_score - original_score
 
-        job_title = meta.get("job_title", "Unknown")
-        company   = meta.get("company", "Unknown")
-        print(f"  {company} — {job_title}: {original_score} → {tailored_score} ({delta:+d})")
+        job_title  = meta.get("job_title", "Unknown")
+        company    = meta.get("company", "Unknown")
+        regression = delta < 0
+        marker     = "⚠️ regressed → keep base" if regression else ""
+        print(f"  {company} — {job_title}: {original_score} → {tailored_score} ({delta:+d}) {marker}")
 
         md5 = hashlib.md5(url.encode()).hexdigest()
         path = os.path.join(TAILORED_DIR, resume_id, f"{md5}.md")
@@ -528,6 +468,7 @@ async def _main_inner(summary: RunSummary):
             "tailored_resume_path": path,
             "optimization_summary": tailor_results[url]["opt_summary"],
             "resume_hash": resume_hash,
+            "regression": regression,
         })
 
     if results:
@@ -536,15 +477,19 @@ async def _main_inner(summary: RunSummary):
     summary.succeeded += len(results)
     summary.failed += max(0, len(to_process) - len(results))
 
-    api_calls = n_tailor_batches + n_rescore_batches + len(tailor_fallback) + len(score_fallback)
-    old_calls = total * 2
+    api_calls = n_tailor_batches + len(tailor_fallback) + len(rescore_items)
     print(f"\nResume Optimizer complete. {len(results)}/{total} jobs processed.")
-    print(f"API calls: {api_calls} (was {old_calls} without batching, saved {old_calls - api_calls})")
+    print(f"API calls: {api_calls} (tailor: {n_tailor_batches} batch + {len(tailor_fallback)} fallback; "
+          f"re-score: {len(rescore_items)} single)")
     _print_summary(xlsx_path, resume_id)
 
 
 def _print_summary(xlsx_path: str, resume_id: str):
-    """Print tailored match summary sorted by score delta."""
+    """Print tailored match summary sorted by score delta.
+
+    Also surfaces regressions (tailored < base) prominently — for those
+    JDs the user should keep using the base resume in profile/.
+    """
     pairs = get_tailored_match_pairs(xlsx_path)
     if not pairs:
         return
@@ -587,6 +532,15 @@ def _print_summary(xlsx_path: str, resume_id: str):
             avg = total_delta / len(rows)
             print(f"{'-'*70}")
             print(f"Average delta: {avg:+.1f}  ({len(rows)} jobs)")
+
+        regressed = [r for r in rows if r[0] < 0]
+        if regressed:
+            print(f"\n⚠️  Regressed (tailored < base) — keep using base resume from profile/")
+            print(f"   {len(regressed)} of {len(rows)} job(s):")
+            for delta, company, title, orig, tail in regressed:
+                c = (company[:18] + "..") if len(company) > 20 else company
+                t = (title[:18] + "..") if len(title) > 20 else title
+                print(f"   [{delta:+d}] {c:<20} {t:<20} ({orig} → {tail})")
     finally:
         wb.close()
 

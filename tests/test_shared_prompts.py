@@ -50,10 +50,6 @@ class TestPromptSingleSource(unittest.TestCase):
     def test_tailor_prompt_lives_in_shared(self):
         self.assertIs(optimizer_mod.TAILOR_SYSTEM_PROMPT, prompts.TAILOR_SYSTEM_PROMPT)
 
-    def test_batch_fine_prompt_starts_with_fine_prompt(self):
-        # Structural — batch is built by concatenating fine + batch instructions.
-        self.assertTrue(prompts.BATCH_FINE_SYSTEM_PROMPT.startswith(prompts.FINE_SYSTEM_PROMPT))
-
 
 class TestSchemaSingleSource(unittest.TestCase):
     """MatchResult and other schemas must reference the SAME class object."""
@@ -72,7 +68,6 @@ class TestSchemaSingleSource(unittest.TestCase):
     def test_optimizer_batch_schemas_live_in_shared(self):
         self.assertIs(optimizer_mod.TailoredResume, schemas.TailoredResume)
         self.assertIs(optimizer_mod.BatchTailoredResult, schemas.BatchTailoredResult)
-        self.assertIs(optimizer_mod.BatchMatchResult, schemas.BatchMatchResult)
 
 
 class TestNoLocalRedefinition(unittest.TestCase):
@@ -92,7 +87,7 @@ class TestNoLocalRedefinition(unittest.TestCase):
         import inspect
         src = inspect.getsource(optimizer_mod)
         for forbidden in ("_FINE_SYSTEM_PROMPT =", "_TAILOR_SYSTEM_PROMPT =",
-                          "_BATCH_FINE_SYSTEM_PROMPT =", "_BATCH_TAILOR_SYSTEM_PROMPT =",
+                          "_BATCH_TAILOR_SYSTEM_PROMPT =",
                           "FINE_SYSTEM_PROMPT =", "TAILOR_SYSTEM_PROMPT ="):
             self.assertNotIn(forbidden, src,
                              f"resume_optimizer.py must not locally redefine: {forbidden}")

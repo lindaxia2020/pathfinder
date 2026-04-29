@@ -60,11 +60,6 @@ class TestSecurityClauseInPrompts(unittest.TestCase):
     def test_tailor_prompt_includes_security_clause(self):
         self.assertIn(prompts.SECURITY_CLAUSE, prompts.TAILOR_SYSTEM_PROMPT)
 
-    def test_batch_fine_prompt_inherits_security_clause(self):
-        # BATCH_FINE_SYSTEM_PROMPT = FINE_SYSTEM_PROMPT + batch instructions,
-        # so it inherits SECURITY_CLAUSE via concatenation.
-        self.assertIn(prompts.SECURITY_CLAUSE, prompts.BATCH_FINE_SYSTEM_PROMPT)
-
     def test_batch_tailor_prompt_inherits_security_clause(self):
         self.assertIn(prompts.SECURITY_CLAUSE, prompts.BATCH_TAILOR_SYSTEM_PROMPT)
 
@@ -133,15 +128,6 @@ class TestResumeOptimizerWrapsScrapedContent(unittest.TestCase):
         contents = self._captured_contents()
         self.assertGreaterEqual(contents.count("<scraped_content>"), 2)
 
-    def test_batch_re_score_wraps_each_pair(self):
-        self.pool.generate_content.return_value.text = '{"items": []}'
-        opt_mod.batch_re_score([
-            {"tailored_resume": "R1", "jd_content": "J1"},
-            {"tailored_resume": "R2", "jd_content": "J2"},
-        ])
-        contents = self._captured_contents()
-        # 2 pairs × 2 wraps each = at least 4 opens
-        self.assertGreaterEqual(contents.count("<scraped_content>"), 4)
 
     def test_batch_tailor_resume_wraps_resume_and_jds(self):
         self.pool.generate_content.return_value.text = '{"items": []}'
