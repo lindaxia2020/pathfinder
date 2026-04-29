@@ -874,11 +874,24 @@ def get_scored_matches(xlsx_path: str = EXCEL_PATH,
     Tailored_Match_Results.
 
     Pass stage=None to include all stages (used by tests / migration).
-    Returns list of dicts: {resume_id, jd_url, score, stage, resume_hash}.
+
+    Returns list of dicts:
+      {
+        resume_id, jd_url, score, stage, resume_hash,
+        # PRJ-002 PR 4: per-dim originals for the optimizer's delta calc.
+        # Any of these may be None if the column doesn't exist or the row's
+        # value is blank (legacy data — caller falls back to `score`).
+        ats_coverage_percent, recruiter_score, hm_score,
+      }
     """
     wb = load_workbook(xlsx_path, read_only=True)
     try:
         ws = wb["Match_Results"]
+        # Dynamic column lookup so old workbooks (pre-PR 2 migration) still work.
+        ws_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col_ats_pct = ws_headers.index("ATS Coverage %") + 1 if "ATS Coverage %" in ws_headers else None
+        col_recruit = ws_headers.index("Recruiter Score") + 1 if "Recruiter Score" in ws_headers else None
+        col_hm      = ws_headers.index("HM Score") + 1 if "HM Score" in ws_headers else None
         results = []
         for r in range(2, ws.max_row + 1):
             rid   = ws.cell(r, 1).value
@@ -890,12 +903,24 @@ def get_scored_matches(xlsx_path: str = EXCEL_PATH,
                 continue
             if stage is not None and str(row_stage) != stage:
                 continue
+            ats_pct  = ws.cell(r, col_ats_pct).value if col_ats_pct else None
+            recruit  = ws.cell(r, col_recruit).value if col_recruit else None
+            hm_score = ws.cell(r, col_hm).value if col_hm else None
             results.append({
                 "resume_id": str(rid),
                 "jd_url": str(url),
                 "score": int(score),
                 "stage": str(row_stage),
                 "resume_hash": str(rhash),
+                "ats_coverage_percent": (
+                    float(ats_pct) if isinstance(ats_pct, (int, float)) else None
+                ),
+                "recruiter_score": (
+                    int(recruit) if isinstance(recruit, (int, float)) else None
+                ),
+                "hm_score": (
+                    int(hm_score) if isinstance(hm_score, (int, float)) else None
+                ),
             })
         return results
     finally:
@@ -928,15 +953,29 @@ def get_tailored_match_pairs(xlsx_path: str = EXCEL_PATH) -> dict:
 def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
     """
     Write multiple tailored match records in a single load→modify→save cycle.
-    records: list of dicts with keys:
-        resume_id, jd_url, job_title, company, original_score,
-        tailored_score, score_delta, tailored_resume_path,
-        optimization_summary, resume_hash, regression
 
-    `regression` is a bool that flags Tailored Score < Original Score; when
-    True, the user should keep using the base resume in profile/. If the
-    caller omits `regression`, we infer it from score_delta < 0.
-    Returns the number of records written.
+    records: list of dicts. Required keys:
+        resume_id, jd_url
+
+    Legacy (single-dimension) keys:
+        job_title, company, original_score, tailored_score, score_delta,
+        tailored_resume_path, optimization_summary, resume_hash, regression
+
+    PRJ-002 PR 4 — per-dim keys (optional):
+        original_ats, tailored_ats, ats_delta,
+        original_recruiter, tailored_recruiter, recruiter_delta,
+        original_hm, tailored_hm, hm_delta
+
+    Regression semantics (PRJ-002 REQ-108):
+      * If caller passes `regression` explicitly → use it.
+      * Else if `hm_delta` is present → regression = (hm_delta < 0).
+        ATS / Recruiter delta < 0 do NOT trigger regression — the ATS
+        dimension can drop when the tailor reshuffles emphasis.
+      * Else (legacy single-score path) → regression = (score_delta < 0).
+
+    Per-dim columns are written when keys are PRESENT in the dict (None is
+    a valid "no data" value). Missing keys leave the corresponding cell
+    untouched on update; on insert, the cell stays blank.
     """
     if not records:
         return 0
@@ -950,10 +989,24 @@ def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
             url = ws.cell(r, 2).value
             if rid and url:
                 idx[(str(rid), str(url))] = r
+        ws_headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        # Per-dim column index lookup (None when column missing).
+        _dim_cols = {
+            name: (ws_headers.index(name) + 1 if name in ws_headers else None)
+            for name in (
+                "Original ATS", "Tailored ATS", "ATS Delta",
+                "Original Recruiter", "Tailored Recruiter", "Recruiter Delta",
+                "Original HM", "Tailored HM", "HM Delta",
+            )
+        }
         for rec in records:
+            # Regression precedence: explicit > hm_delta > score_delta (legacy).
             regression = rec.get("regression")
             if regression is None:
-                regression = bool(int(rec.get("score_delta", 0)) < 0)
+                if "hm_delta" in rec and rec["hm_delta"] is not None:
+                    regression = bool(int(rec["hm_delta"]) < 0)
+                else:
+                    regression = bool(int(rec.get("score_delta", 0)) < 0)
             row_data = [
                 rec["resume_id"], rec["jd_url"], rec.get("job_title", ""),
                 rec.get("company", ""), rec.get("original_score", 0),
@@ -964,11 +1017,28 @@ def batch_upsert_tailored_records(xlsx_path: str, records: list) -> int:
             ]
             key = (str(rec["resume_id"]), str(rec["jd_url"]))
             if key in idx:
+                target_row = idx[key]
                 for col, val in enumerate(row_data, 1):
-                    ws.cell(idx[key], col, val)
+                    ws.cell(target_row, col, val)
             else:
                 ws.append(row_data)
                 idx[key] = ws.max_row
+                target_row = idx[key]
+            # PR 4: per-dim writes — only for keys PRESENT in dict (None ok).
+            _dim_keys = (
+                ("original_ats",        "Original ATS"),
+                ("tailored_ats",        "Tailored ATS"),
+                ("ats_delta",           "ATS Delta"),
+                ("original_recruiter",  "Original Recruiter"),
+                ("tailored_recruiter",  "Tailored Recruiter"),
+                ("recruiter_delta",     "Recruiter Delta"),
+                ("original_hm",         "Original HM"),
+                ("tailored_hm",         "Tailored HM"),
+                ("hm_delta",            "HM Delta"),
+            )
+            for rec_key, col_name in _dim_keys:
+                if rec_key in rec and _dim_cols[col_name]:
+                    ws.cell(target_row, _dim_cols[col_name], rec[rec_key])
         wb.save(xlsx_path)
         return len(records)
     finally:

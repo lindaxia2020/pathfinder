@@ -705,6 +705,202 @@ class TestMatchHelpers(unittest.TestCase):
         self.assertEqual(pairs[("rx", "https://bad.com/jd")]["score"], 0)
 
 
+class TestPRJ002GetScoredMatchesPerDim(unittest.TestCase):
+    """PRJ-002 PR 4 — get_scored_matches returns per-dim columns
+    (None when column missing or value blank)."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _match_json(self, score=70):
+        return json.dumps({
+            "compatibility_score": score,
+            "key_strengths": [], "critical_gaps": [],
+            "recommendation_reason": "ok",
+        })
+
+    def test_reads_per_dim_columns_when_present(self):
+        # Write a fine-stage row WITH all 3 dims (PR 3+ shape).
+        batch_upsert_match_records(self.path, [{
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "match_json": self._match_json(80),
+            "resume_hash": "h", "stage": "fine",
+            "ats_coverage_percent": 65.5,
+            "ats_missing": ["Rust"],
+            "recruiter_score": 72,
+            "hm_score": 80,
+        }])
+        scored = get_scored_matches(self.path, stage="fine")
+        self.assertEqual(len(scored), 1)
+        m = scored[0]
+        self.assertEqual(m["score"], 80)
+        self.assertEqual(m["ats_coverage_percent"], 65.5)
+        self.assertEqual(m["recruiter_score"], 72)
+        self.assertEqual(m["hm_score"], 80)
+
+    def test_returns_none_for_blank_per_dim_cells(self):
+        # Legacy row (pre-PR 3): only Score column, new dim cols blank.
+        upsert_match_record(self.path, "r1", "https://a.com/1",
+                            self._match_json(75), "h", "fine")
+        scored = get_scored_matches(self.path, stage="fine")
+        m = scored[0]
+        self.assertEqual(m["score"], 75)
+        self.assertIsNone(m["ats_coverage_percent"])
+        self.assertIsNone(m["recruiter_score"])
+        self.assertIsNone(m["hm_score"])
+
+
+class TestPRJ002TailoredPerDimWrites(unittest.TestCase):
+    """PRJ-002 PR 4 — batch_upsert_tailored_records writes per-dim columns."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _read_row(self):
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value:
+                row = {h: ws.cell(r, c + 1).value for c, h in enumerate(headers)}
+                wb.close()
+                return row
+        wb.close()
+        return None
+
+    def test_writes_all_per_dim_columns(self):
+        rec = {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "job_title": "TPM", "company": "Acme",
+            "original_score": 42, "tailored_score": 45, "score_delta": 3,
+            "tailored_resume_path": "/p", "optimization_summary": "s",
+            "resume_hash": "h",
+            # PR 4 per-dim:
+            "original_ats": 40.0, "tailored_ats": 92.0, "ats_delta": 52.0,
+            "original_recruiter": 58, "tailored_recruiter": 64, "recruiter_delta": 6,
+            "original_hm": 42, "tailored_hm": 45, "hm_delta": 3,
+        }
+        batch_upsert_tailored_records(self.path, [rec])
+        row = self._read_row()
+        # Per-dim columns
+        self.assertEqual(row["Original ATS"], 40.0)
+        self.assertEqual(row["Tailored ATS"], 92.0)
+        self.assertEqual(row["ATS Delta"], 52.0)
+        self.assertEqual(row["Original Recruiter"], 58)
+        self.assertEqual(row["Tailored Recruiter"], 64)
+        self.assertEqual(row["Recruiter Delta"], 6)
+        self.assertEqual(row["Original HM"], 42)
+        self.assertEqual(row["Tailored HM"], 45)
+        self.assertEqual(row["HM Delta"], 3)
+        # Legacy mirroring
+        self.assertEqual(row["Original Score"], 42)
+        self.assertEqual(row["Tailored Score"], 45)
+        self.assertEqual(row["Score Delta"], 3)
+
+    def test_none_per_dim_writes_none(self):
+        rec = {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "original_score": 50, "tailored_score": 50, "score_delta": 0,
+            "resume_hash": "h",
+            "original_ats": None, "tailored_ats": None, "ats_delta": None,
+            "original_recruiter": None, "tailored_recruiter": 60, "recruiter_delta": None,
+        }
+        batch_upsert_tailored_records(self.path, [rec])
+        row = self._read_row()
+        self.assertIsNone(row["Original ATS"])
+        self.assertIsNone(row["Tailored ATS"])
+        self.assertIsNone(row["ATS Delta"])
+        self.assertIsNone(row["Original Recruiter"])
+        self.assertEqual(row["Tailored Recruiter"], 60)
+        self.assertIsNone(row["Recruiter Delta"])
+
+
+class TestPRJ002RegressionFromHMDelta(unittest.TestCase):
+    """PRJ-002 PR 4 / REQ-108 — regression rule prefers hm_delta over score_delta.
+
+    Critical correctness property: ATS / Recruiter dropping while HM holds
+    must NOT mark a regression. The user wants to keep using the tailored
+    resume in that case (better keywords, same fit)."""
+
+    def setUp(self):
+        self.path = _tmp_xlsx()
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _read_regression(self):
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Tailored_Match_Results"]
+        headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        col = headers.index("Regression") + 1
+        result = ws.cell(2, col).value
+        wb.close()
+        return result
+
+    def _base_rec(self):
+        return {
+            "resume_id": "r1", "jd_url": "https://a.com/1",
+            "job_title": "TPM", "company": "Acme",
+            "tailored_resume_path": "/p", "optimization_summary": "s",
+            "resume_hash": "h",
+        }
+
+    def test_explicit_regression_wins(self):
+        rec = self._base_rec()
+        rec.update({"score_delta": 10, "hm_delta": 10, "regression": True})
+        batch_upsert_tailored_records(self.path, [rec])
+        self.assertTrue(self._read_regression())
+
+    def test_hm_delta_negative_marks_regression(self):
+        rec = self._base_rec()
+        rec.update({"score_delta": -3, "hm_delta": -3})
+        batch_upsert_tailored_records(self.path, [rec])
+        self.assertTrue(self._read_regression())
+
+    def test_hm_delta_positive_no_regression(self):
+        rec = self._base_rec()
+        rec.update({"score_delta": 5, "hm_delta": 5})
+        batch_upsert_tailored_records(self.path, [rec])
+        self.assertFalse(self._read_regression())
+
+    def test_ats_drop_with_hm_hold_no_regression(self):
+        """ATS drops a lot, HM holds → NOT a regression (REQ-108)."""
+        rec = self._base_rec()
+        rec.update({
+            "score_delta": 0,        # legacy mirrors HM = 0 (no change)
+            "hm_delta": 0,
+            "ats_delta": -30.0,      # big ATS drop — should NOT regress
+            "recruiter_delta": -5,   # Recruiter drop — should NOT regress
+        })
+        batch_upsert_tailored_records(self.path, [rec])
+        self.assertFalse(self._read_regression())
+
+    def test_legacy_fallback_to_score_delta(self):
+        """When hm_delta absent (pre-PR 4 caller), fall back to score_delta."""
+        rec = self._base_rec()
+        rec.update({"score_delta": -5})
+        batch_upsert_tailored_records(self.path, [rec])
+        self.assertTrue(self._read_regression())
+
+    def test_legacy_fallback_zero_no_regression(self):
+        rec = self._base_rec()
+        rec.update({"score_delta": 0})
+        batch_upsert_tailored_records(self.path, [rec])
+        self.assertFalse(self._read_regression())
+
+
 class TestPRJ002BatchUpsertDictFormat(unittest.TestCase):
     """PRJ-002 PR 3 — dict-format records write 3-dim columns; tuple format
     still works (back-compat); 'key absent' on dicts preserves prior values."""

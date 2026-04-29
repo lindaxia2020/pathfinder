@@ -41,6 +41,13 @@ from shared.schemas import (
     MatchResult, TailoredResume,
     BatchTailoredItem, BatchTailoredResult,
 )
+# PRJ-002 PR 4: 3-dimension rescore.
+#   - ATS dim: deterministic, reuses shared/ats_matcher.compute_coverage
+#   - Recruiter dim: reuses match_agent.batch_coarse_score (1-element batch)
+#   - HM dim: existing re_score() with FINE_SYSTEM_PROMPT (kept identical
+#     to match_agent's Stage 2 so deltas are comparable per REQ-052).
+from shared.ats_matcher import compute_coverage
+from agents.match_agent import batch_coarse_score, _extract_ats_keywords
 
 # BUG-41: single shared limiter for all Gemini calls
 _GEMINI_LIMITER = _RateLimiter(rpm=13)
@@ -254,6 +261,10 @@ async def _main_inner(summary: RunSummary):
         summary.note("Missing GEMINI_API_KEY")
         return
     _KEY_POOL = _GeminiKeyPoolBase(gemini_keys, genai_mod=genai)
+    # PR 4: batch_coarse_score (Recruiter rescore) reads match_agent._KEY_POOL.
+    # Share the same pool so the cross-agent call works without a separate init.
+    import agents.match_agent as _match_mod
+    _match_mod._KEY_POOL = _KEY_POOL
     logging.info(f"[KeyPool] Loaded {len(gemini_keys)} Gemini API key(s).")
 
     print("\n" + "=" * 60)
@@ -395,39 +406,63 @@ async def _main_inner(summary: RunSummary):
 
     print(f"\n[Phase 1 done] {len(tailor_results)}/{len(job_items)} resumes tailored.")
 
-    # ── Phase 2: Re-score (single JD/call, FINE_SYSTEM_PROMPT) ─────
-    # Mirrors agents/match_agent.py:411-448 so original fine score and
-    # tailored re-score share the same call shape — Score Delta then
-    # reflects the resume change, not batch-context anchoring.
+    # ── Phase 2: 3-dim rescore — ATS (det.) + Recruiter (LLM) + HM (LLM) ───
+    # Per JD: 1 deterministic ATS pass + 1 Recruiter Gemini call + 1 HM Gemini call.
+    # HM uses the same FINE_SYSTEM_PROMPT path as match_agent's Stage 2 so deltas
+    # remain comparable (REQ-052). Regression flag reflects HM delta only.
     rescore_items = [item for item in job_items if item["url"] in tailor_results]
     print(f"\n[Phase 2] Re-scoring {len(rescore_items)} tailored resumes "
-          f"(1 JD/call, FINE_SYSTEM_PROMPT)...\n")
+          f"on 3 dimensions (ATS det. + Recruiter + HM)...\n")
 
-    score_results: dict[str, dict] = {}   # url -> score data dict
+    score_results: dict[str, dict]     = {}  # url -> HM JSON dict
+    ats_results: dict[str, dict]       = {}  # url -> coverage dict (post-tailor)
+    recruiter_results: dict[str, int]  = {}  # url -> int score (post-tailor)
     sem = asyncio.Semaphore(RESCORE_CONCURRENCY)
 
     async def rescore_one(item: dict, idx: int, total: int) -> None:
         async with sem:
             url = item["url"]
             company = item["meta"].get("company", "?")
+            tailored_md = tailor_results[url]["tailored_md"]
+            jd_dict = {"jd_json": item["meta"].get("jd_json", "")}
+
+            # 1. ATS rescore — deterministic, no Gemini.
+            ats_kws = _extract_ats_keywords(jd_dict)
+            ats_results[url] = compute_coverage(ats_kws, tailored_md)
+
+            # 2. Recruiter rescore — single-JD Gemini call via batch_coarse_score.
+            await limiter.acquire()
+            rec_scores = await asyncio.to_thread(
+                batch_coarse_score, tailored_md, [jd_dict]
+            )
+            if rec_scores:
+                recruiter_results[url] = max(1, rec_scores[0])
+            # If empty list (structural failure), recruiter_results omits this url
+            # → downstream will write Tailored Recruiter as None.
+
+            # 3. HM rescore — same call shape as match_agent's fine eval.
             await limiter.acquire()
             score_json = await asyncio.to_thread(
-                re_score, tailor_results[url]["tailored_md"], item["jd_content"]
+                re_score, tailored_md, item["jd_content"]
             )
             # P0-4: None = structural error; drop the record (do not write fake score=0).
             if score_json is None:
-                logging.error(f"  [Re-score {idx}/{total}] {company} — structural error, dropped")
+                logging.error(f"  [Re-score {idx}/{total}] {company} — HM structural error, dropped")
                 summary.structural_errors += 1
                 return
             try:
                 parsed = json.loads(score_json)
             except Exception as e:
-                logging.error(f"  [Re-score {idx}/{total}] {company} — parse failed: {e}; dropped")
+                logging.error(f"  [Re-score {idx}/{total}] {company} — HM parse failed: {e}; dropped")
                 summary.structural_errors += 1
                 return
             score_results[url] = parsed
-            score = parsed.get("compatibility_score", 0)
-            print(f"  [Re-score {idx}/{total}] {company} — {score}/100")
+            hm = parsed.get("compatibility_score", 0)
+            ats_pct = ats_results[url].get("percent")
+            rec = recruiter_results.get(url)
+            ats_str = f"ATS {ats_pct}%" if ats_pct is not None else "ATS —"
+            rec_str = f"Rec {rec}" if rec is not None else "Rec —"
+            print(f"  [Re-score {idx}/{total}] {company} — {ats_str} | {rec_str} | HM {hm}/100")
 
     if rescore_items:
         total = len(rescore_items)
@@ -436,6 +471,12 @@ async def _main_inner(summary: RunSummary):
         ])
 
     # ── Phase 3: Assemble results + write Excel ────────────────────
+    def _delta(orig, tail):
+        """Compute delta where both sides are not None; else None."""
+        if orig is None or tail is None:
+            return None
+        return tail - orig
+
     results: list[dict] = []
     for item in job_items:
         url = item["url"]
@@ -443,16 +484,41 @@ async def _main_inner(summary: RunSummary):
             continue
         meta = item["meta"]
         match = item["match"]
-        score_data = score_results[url]
-        tailored_score = score_data.get("compatibility_score", 0)
-        original_score = match["score"]
-        delta = tailored_score - original_score
+
+        # HM dim — drives legacy Score / Score Delta / Regression columns.
+        score_data    = score_results[url]
+        tailored_hm   = score_data.get("compatibility_score", 0)
+        # Fallback chain: prefer hm_score (PR 3+), else legacy match["score"]
+        # (which equals HM for fine-stage rows after PR 3).
+        original_hm   = match.get("hm_score") or match.get("score") or 0
+        hm_delta      = tailored_hm - original_hm
+
+        # ATS dim — percent or None (legacy JDs without ats_keywords).
+        original_ats  = match.get("ats_coverage_percent")
+        tailored_ats  = ats_results.get(url, {}).get("percent")
+        ats_delta     = _delta(original_ats, tailored_ats)
+        if ats_delta is not None:
+            ats_delta = round(ats_delta, 1)
+
+        # Recruiter dim — int score or None when previous run lacked it.
+        original_rec  = match.get("recruiter_score")
+        tailored_rec  = recruiter_results.get(url)
+        rec_delta     = _delta(original_rec, tailored_rec)
 
         job_title  = meta.get("job_title", "Unknown")
         company    = meta.get("company", "Unknown")
-        regression = delta < 0
-        marker     = "⚠️ regressed → keep base" if regression else ""
-        print(f"  {company} — {job_title}: {original_score} → {tailored_score} ({delta:+d}) {marker}")
+        # Regression: HM-delta-only per REQ-108. ATS / Recruiter drops are
+        # information, not regressions — the tailor reshuffling emphasis
+        # away from a recruiter keyword while preserving HM fit is fine.
+        regression = hm_delta < 0
+        marker     = "⚠️ HM regressed → keep base" if regression else ""
+
+        ats_part = f"ATS {original_ats}→{tailored_ats} ({ats_delta:+.1f})" \
+                   if ats_delta is not None else "ATS —"
+        rec_part = f"Rec {original_rec}→{tailored_rec} ({rec_delta:+d})" \
+                   if rec_delta is not None else "Rec —"
+        print(f"  {company} — {job_title}:")
+        print(f"      {ats_part}  |  {rec_part}  |  HM {original_hm}→{tailored_hm} ({hm_delta:+d}) {marker}")
 
         md5 = hashlib.md5(url.encode()).hexdigest()
         path = os.path.join(TAILORED_DIR, resume_id, f"{md5}.md")
@@ -462,13 +528,24 @@ async def _main_inner(summary: RunSummary):
             "jd_url": url,
             "job_title": job_title,
             "company": company,
-            "original_score": original_score,
-            "tailored_score": tailored_score,
-            "score_delta": delta,
+            # Legacy columns mirror HM dimension (back-compat):
+            "original_score": original_hm,
+            "tailored_score": tailored_hm,
+            "score_delta": hm_delta,
             "tailored_resume_path": path,
             "optimization_summary": tailor_results[url]["opt_summary"],
             "resume_hash": resume_hash,
             "regression": regression,
+            # PR 4 per-dim:
+            "original_ats": original_ats,
+            "tailored_ats": tailored_ats,
+            "ats_delta":    ats_delta,
+            "original_recruiter": original_rec,
+            "tailored_recruiter": tailored_rec,
+            "recruiter_delta":    rec_delta,
+            "original_hm":  original_hm,
+            "tailored_hm":  tailored_hm,
+            "hm_delta":     hm_delta,
         })
 
     if results:
@@ -477,10 +554,11 @@ async def _main_inner(summary: RunSummary):
     summary.succeeded += len(results)
     summary.failed += max(0, len(to_process) - len(results))
 
-    api_calls = n_tailor_batches + len(tailor_fallback) + len(rescore_items)
+    api_calls = n_tailor_batches + len(tailor_fallback) + 2 * len(rescore_items)
     print(f"\nResume Optimizer complete. {len(results)}/{total} jobs processed.")
     print(f"API calls: {api_calls} (tailor: {n_tailor_batches} batch + {len(tailor_fallback)} fallback; "
-          f"re-score: {len(rescore_items)} single)")
+          f"re-score: {len(rescore_items)} × 2 [Recruiter + HM]; "
+          f"ATS dim is deterministic, no API)")
     _print_summary(xlsx_path, resume_id)
 
 

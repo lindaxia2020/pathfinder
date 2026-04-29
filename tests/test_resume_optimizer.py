@@ -427,23 +427,80 @@ class TestBug50PrintSummaryDynamicColumns(unittest.TestCase):
 
 
 class TestRegressionFlagAssembly(unittest.TestCase):
-    """Optimizer's Phase 3 assembly must include `regression = delta < 0`
-    in the record dict that goes to batch_upsert_tailored_records.
+    """Optimizer's Phase 3 assembly must compute regression from HM delta only
+    (PRJ-002 REQ-108). ATS / Recruiter dropping below origin is not a regression.
 
-    Mirrors the source pattern:
-        regression = delta < 0
+    Source pattern after PR 4:
+        regression = hm_delta < 0
         results.append({..., "regression": regression})
     """
 
-    def test_negative_delta_marks_regression_true(self):
-        """When tailored < base, the assembled record must have regression=True."""
+    def test_regression_uses_hm_delta_only(self):
+        """The regression flag must reflect HM delta, not score_delta or others."""
         import inspect
         src = inspect.getsource(optimizer_mod._main_inner)
-        # Source-level guard: the regression key must be passed in the record dict.
+        # Source-level guards for the new HM-delta-only semantics.
         self.assertIn('"regression": regression', src,
                       "_main_inner must include regression flag in tailored record")
-        self.assertIn("regression = delta < 0", src,
-                      "_main_inner must compute regression from score delta")
+        self.assertIn("regression = hm_delta < 0", src,
+                      "_main_inner must compute regression from HM delta only (REQ-108)")
+        # ATS / Recruiter drops MUST NOT trigger regression.
+        self.assertNotIn("regression = ats_delta", src)
+        self.assertNotIn("regression = recruiter_delta", src)
+
+
+class TestPRJ002ThreeDimRescore(unittest.TestCase):
+    """PRJ-002 PR 4 — optimizer rescores all 3 dimensions per JD.
+
+    These tests guard the structural shape of _main_inner: required imports,
+    the per-dim record keys, and the call sites for ATS / Recruiter rescore.
+    Behavior tests (delta math, None handling) live in test_excel_store.py
+    against batch_upsert_tailored_records.
+    """
+
+    def test_imports_compute_coverage_and_batch_coarse_score(self):
+        # The 3-dim rescore needs both the deterministic ATS path and the
+        # cross-agent Recruiter path. If either import is missing, the
+        # rescore_one inner function will NameError at runtime.
+        self.assertTrue(hasattr(optimizer_mod, "compute_coverage"))
+        self.assertTrue(hasattr(optimizer_mod, "batch_coarse_score"))
+        self.assertTrue(hasattr(optimizer_mod, "_extract_ats_keywords"))
+
+    def test_rescore_one_calls_all_three_dimensions(self):
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        # Each dimension must appear in the rescore_one body.
+        self.assertIn("compute_coverage", src)
+        self.assertIn("batch_coarse_score", src)
+        self.assertIn("re_score", src)
+
+    def test_assembled_record_includes_per_dim_keys(self):
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        # All 9 per-dim keys must be present in the assembled record dict.
+        for key in (
+            '"original_ats"', '"tailored_ats"', '"ats_delta"',
+            '"original_recruiter"', '"tailored_recruiter"', '"recruiter_delta"',
+            '"original_hm"', '"tailored_hm"', '"hm_delta"',
+        ):
+            self.assertIn(key, src, f"Missing per-dim record key: {key}")
+
+    def test_legacy_score_columns_mirror_hm(self):
+        """Back-compat: original_score / tailored_score / score_delta mirror HM."""
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        # Find the legacy keys and verify they're populated from *_hm vars.
+        self.assertIn('"original_score": original_hm', src)
+        self.assertIn('"tailored_score": tailored_hm', src)
+        self.assertIn('"score_delta": hm_delta', src)
+
+    def test_shares_key_pool_with_match_agent(self):
+        """Recruiter rescore reuses match_agent.batch_coarse_score, which reads
+        match_agent._KEY_POOL. Optimizer's main must seed match_agent's pool."""
+        import inspect
+        src = inspect.getsource(optimizer_mod._main_inner)
+        self.assertIn("_match_mod._KEY_POOL", src,
+                      "Optimizer must propagate its key pool into match_agent module")
 
 
 class TestBug54KeyPoolNoneGuard(unittest.TestCase):
