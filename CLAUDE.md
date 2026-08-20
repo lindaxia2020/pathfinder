@@ -77,6 +77,19 @@ will enrich them on the next pipeline run:
   for retry. `Track` should be one of the 6 buckets (AI-native / Mid-large
   Tech / Robotics / Fintech / Space / Defense); unknown/custom values take
   the strict Mid-large-Tech per-JD classifier path with a logged warning.
+  **Filled Career URLs are user-verified data (BUG-74/75): no pipeline step
+  ever rewrites them** — blank-URL backfill is the only Career URL write.
+  The correction loop: `python agents/company_agent.py --audit`
+  (report-only → transient `Company_Audit` tab; options `--audit-limit N`,
+  `--audit-skip-http`; add `--suggest-urls` [+`--suggest-non-ats`,
+  `--suggest-limit N`] to fill Suggested URL/Evidence columns for flagged
+  rows) → user reviews, types Y in "Approve URL?" where accepted →
+  `--apply-audit` writes proposed Track/Focus and ONLY user-approved
+  suggested URLs back to Company_List (`--urls-only` skips Track/Focus).
+  Anti-oscillation: applied Track/Focus decisions are recorded in
+  `logs/company_audit_ledger.json`; audits never re-propose changes away
+  from a user-confirmed value (hand-edit the cell or delete the ledger to
+  re-open).
 - **JD_Tracker** — insert a row with just `JD URL` + `Company`. The job_agent
   picks it up via `get_incomplete_jd_rows` and runs full extraction. Note:
   manually-inserted rows pass the same write-time gates as discovery

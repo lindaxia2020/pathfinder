@@ -344,9 +344,15 @@ def upsert_companies(xlsx_path: str, companies_data: list):
     For NEW companies: write all 9 columns with TPM counts initialized to
     [0, 0, 0, "No"].
     For EXISTING companies: only update cols 1–5 (Name, Track, Focus,
-    Career URL, Updated At). Cols 6–9 (TPM Jobs, Qualified Jobs, No TPM Count,
-    Auto Archived) are preserved — they are managed exclusively by
-    update_company_job_counts and the auto-archival pipeline.
+    Career URL, Updated At) — EXCEPT a filled Career URL, which is
+    user-verified data and is never overwritten (REQ-153/BUG-75; only a
+    blank/N-A cell accepts a value). Cols 6–9 (TPM Jobs, Qualified Jobs,
+    No TPM Count, Auto Archived) are preserved — they are managed exclusively
+    by update_company_job_counts and the auto-archival pipeline.
+
+    Note: discovery dedup normally prevents existing names from reaching
+    this function at all — the Career URL guard here is the storage-layer
+    invariant so no upstream regression can ever clobber a verified URL.
     """
     wb = load_workbook(xlsx_path)
     try:
@@ -359,6 +365,10 @@ def upsert_companies(xlsx_path: str, companies_data: list):
                            c.get("career_url", "N/A"), now]
             if name in idx:
                 for col, val in enumerate(cols_1_to_5, 1):
+                    if col == 4:
+                        existing_url = str(ws.cell(idx[name], 4).value or "").strip()
+                        if existing_url and existing_url.upper() != "N/A":
+                            continue  # user-verified Career URL — never overwritten
                     ws.cell(idx[name], col, val)
             else:
                 ws.append(cols_1_to_5 + [0, 0, 0, "No"])
@@ -442,6 +452,79 @@ def update_company_track(xlsx_path: str, excel_row: int, track: str):
         ws = wb["Company_List"]
         ws.cell(excel_row, 2, track)
         wb.save(xlsx_path)
+    finally:
+        wb.close()
+
+
+# ── Company audit tab (BUG-74~77 staged review) ───────────────────────────────
+# Transient, tool-owned review tab written ONLY by `company_agent --audit`.
+# Deliberately NOT in get_or_create_excel's auto-create list: it exists only
+# while an audit is under user review. The audit never modifies Company_List.
+AUDIT_SHEET = "Company_Audit"
+AUDIT_HEADERS = ["Company Name", "Current Track", "Proposed Track", "Track Changed?",
+                 "Current Focus (truncated)", "Proposed Focus", "Focus Changed?",
+                 "URL Flags", "Confidence", "Notes", "Audited At",
+                 # --suggest-urls columns: a suggested replacement Career URL
+                 # for flagged rows + how it was found. "Approve URL?" is
+                 # USER-owned: type Y/yes on rows to accept — --apply-audit
+                 # writes ONLY approved suggestions (sole exception to the
+                 # never-rewrite-filled-URLs rule, REQ-153).
+                 "Suggested URL", "URL Evidence", "Approve URL?"]
+
+
+def replace_audit_sheet(xlsx_path: str, rows: list[list],
+                        sheet_name: str = AUDIT_SHEET,
+                        headers: list[str] | None = None) -> int:
+    """Create-or-replace the audit review tab with `rows`.
+
+    Deletes only `sheet_name` when present — no other tab is ever touched.
+    Idempotent: re-running an audit fully replaces the previous report.
+    Returns the number of data rows written.
+    """
+    headers = headers if headers is not None else AUDIT_HEADERS
+    wb = load_workbook(xlsx_path)
+    try:
+        if sheet_name in wb.sheetnames:
+            del wb[sheet_name]
+        ws = wb.create_sheet(sheet_name)
+        ws.append(headers)
+        for row in rows:
+            ws.append(row)
+        wb.save(xlsx_path)
+        return len(rows)
+    finally:
+        wb.close()
+
+
+def get_audit_proposals(xlsx_path: str = EXCEL_PATH) -> list[dict]:
+    """Read Company_Audit rows that carry a proposed Track and/or Focus.
+
+    Returns [{"name", "proposed_track", "proposed_focus", "suggested_url",
+    "url_approved"}] — keyed by Company Name (NEVER excel_row: the audit tab
+    and Company_List sort/shift independently, and the user may delete rows
+    between audit and apply). `url_approved` is True only when the user typed
+    Y/yes in the "Approve URL?" column. Empty list when the tab is missing.
+    """
+    wb = load_workbook_readonly(xlsx_path)
+    try:
+        if AUDIT_SHEET not in wb.sheetnames:
+            return []
+        ws = wb[AUDIT_SHEET]
+        out = []
+        for r in range(2, ws.max_row + 1):
+            name = str(ws.cell(r, 1).value or "").strip()
+            if not name:
+                continue
+            track = str(ws.cell(r, 3).value or "").strip()
+            focus = str(ws.cell(r, 6).value or "").strip()
+            suggested = str(ws.cell(r, 12).value or "").strip()
+            approved = str(ws.cell(r, 14).value or "").strip().lower() in ("y", "yes")
+            if track or focus or suggested:
+                out.append({"name": name, "proposed_track": track,
+                            "proposed_focus": focus,
+                            "suggested_url": suggested,
+                            "url_approved": approved})
+        return out
     finally:
         wb.close()
 
@@ -1052,9 +1135,25 @@ _TX_CITY_HINTS = (
     "austin", "dallas", "houston", "san antonio", "fort worth", "plano",
     "irving", "richardson", "el paso",
 )
+# FL is Space-track-only (2026-08-19): classify_region recognizes it
+# unconditionally, but the job_agent geo gates keep "FL" rows only when the
+# company Track is "Space" — every other track treats FL like "Other".
+# City hints limited to unambiguous metros ("melbourne" excluded — collides
+# with Melbourne, Australia; "Melbourne, FL" still matches via ", fl").
+_FL_CITY_HINTS = (
+    "cape canaveral", "merritt island", "titusville", "orlando",
+    "jacksonville",
+)
+
+# WA state token (", WA" / ", WA, USA" / "Seattle, WA 98101"). Word boundary
+# guards against ", Wales"-style substrings; bare "Washington" is still
+# excluded (D.C. collision) — state-qualified forms go via
+# _WASHINGTON_STATE_FORMS.
+_WA_STATE_RE = re.compile(r",\s*wa\b")
 
 # Sort-group precedence inside compute_sort_tier / best-region selection.
-_REGION_PRIORITY = {"Seattle": 0, "Remote": 1, "CA": 2, "TX": 3, "Other": 8, "Unknown": 9}
+_REGION_PRIORITY = {"WA": 0, "Remote": 1, "CA": 2, "TX": 3, "FL": 4,
+                    "Other": 8, "Unknown": 9}
 
 _SORT_TIER_FILL = {
     1: PatternFill(start_color="C6EFCE", end_color="C6EFCE", fill_type="solid"),  # Excel "Good" green
@@ -1114,11 +1213,15 @@ def classify_location(location: str) -> str:
 
 
 def _classify_region_segment(seg: str) -> str:
-    """Classify one lowercase location segment → Seattle/Remote/CA/TX/Other."""
-    if ", wa" in seg and any(city in seg for city in _GREATER_SEATTLE_CITIES):
-        return "Seattle"
+    """Classify one lowercase location segment → WA/Remote/CA/TX/FL/Other."""
+    # Whole WA state qualifies (2026-08-19 widening: Seattle metro → WA, so
+    # Spokane/Vancouver/Olympia etc. are kept). Any ", WA" state token or an
+    # explicitly state-qualified "Washington" form; bare "Washington" still
+    # → Other (D.C. collision).
+    if _WA_STATE_RE.search(seg):
+        return "WA"
     if seg in _WASHINGTON_STATE_FORMS:
-        return "Seattle"
+        return "WA"
     if seg == "remote":
         return "Remote"
     if seg.startswith("remote,"):
@@ -1130,15 +1233,18 @@ def _classify_region_segment(seg: str) -> str:
         return "CA"
     if ", tx" in seg or "texas" in seg or any(c in seg for c in _TX_CITY_HINTS):
         return "TX"
+    if ", fl" in seg or "florida" in seg or any(c in seg for c in _FL_CITY_HINTS):
+        return "FL"
     return "Other"
 
 
 def classify_region(location: str) -> str:
     """PRJ-004 REQ-004-12: classify a JD Location string into
-    'Seattle' / 'Remote' / 'CA' / 'TX' / 'Other' / 'Unknown'.
+    'WA' / 'Remote' / 'CA' / 'TX' / 'FL' / 'Other' / 'Unknown'.
+    'FL' is kept by the job_agent geo gates only on the Space track (REQ-162).
 
     Multi-location strings ('; '-separated) qualify if ANY segment qualifies;
-    the best region wins (precedence Seattle > Remote > CA > TX) so the sort
+    the best region wins (precedence WA > Remote > CA > TX > FL) so the sort
     tier reflects the most desirable posting location. Blank / placeholder
     locations return 'Unknown' — callers keep those rows (conservative: only
     confirmed out-of-region rows are dropped; see BUG-66).
@@ -1187,20 +1293,21 @@ def compute_freshness_tier(posted_date: str, today: date | None = None) -> int |
 
 def compute_sort_tier(freshness_tier: int | None, region: str) -> int:
     """PRJ-004 REQ-004-15: combined 1–6 sort tier (freshness primary,
-    Seattle+Remote > CA/TX secondary):
+    WA+Remote > CA/TX/FL secondary; FL rows exist only on the Space track,
+    REQ-162):
 
-        (T1, Sea/Rem)=1  (T1, CA/TX)=2
-        (T2, Sea/Rem)=3  (T2, CA/TX)=4
-        (T3, Sea/Rem)=5  (T3, CA/TX)=6
+        (T1, WA/Rem)=1  (T1, CA/TX/FL)=2
+        (T2, WA/Rem)=3  (T2, CA/TX/FL)=4
+        (T3, WA/Rem)=5  (T3, CA/TX/FL)=6
 
     Unknown-date rows, aged grandfathered rows, and Other/Unknown regions → 9
     (sink to the bottom, visible for manual review — never deleted).
     """
     if freshness_tier not in (1, 2, 3):
         return 9
-    if region in ("Seattle", "Remote"):
+    if region in ("WA", "Remote"):
         group = 0
-    elif region in ("CA", "TX"):
+    elif region in ("CA", "TX", "FL"):
         group = 1
     else:
         return 9

@@ -1,5 +1,207 @@
 # CHANGELOG
 
+## 2026-08-19 (filter widening: titles + WA geo)
+
+### Title filter: Technical Project Manager everywhere; plain Program Manager on 4 vertical tracks
+
+Recall widening at the cheap top of the funnel (write-time gates — domain /
+YoE / work-auth — keep final precision):
+- **`TPM_KW`** now also matches "Technical Project Manager" (+ mgr/tech
+  variants) on every track — many companies use it for the same senior role.
+- **New `PM_TITLE_OK_TRACKS`** = {AI-native, Robotics, Space, Defense}:
+  `_tpm_filter` additionally accepts plain "Program Manager" titles there
+  (small orgs, loose titling — most PM roles are technical). Fintech and
+  Mid-large Tech keep the strict TPM rule (large non-technical PM
+  populations). `track` is now threaded `process_company → discover_jobs →
+  _discover_via_api → _tpm_filter`.
+- **`llm_filter_jobs`** (non-ATS path) rules updated to mirror the same
+  three-way split (PM-OK vertical / Fintech / mid-large).
+- **Server-side queries**: Workday `searchText` and Firecrawl map search
+  broadened "Technical Program Manager" → "Program Manager" (they pre-narrow
+  before any client filter). Amazon/Google queries deliberately kept —
+  Mid-large Tech, and broader queries risk the pagination caps.
+
+### Geo: Seattle metro → all of Washington state
+
+`classify_region` region "Seattle" renamed **"WA"** and now matches any
+`", WA"` state token (word-boundary regex; Spokane/Vancouver/Olympia etc.)
+plus the explicit Washington-state forms. Bare "Washington" still → Other
+(D.C. collision). Keep-set is now **WA/CA/TX/US-Remote**; sort-tier grouping
+unchanged (WA+Remote > CA/TX). Legacy `classify_location` (no production
+callers) untouched.
+
+### Company discovery aligned to the same geo scope
+
+`company_agent`'s two geo touchpoints (both soft biases, no deterministic
+filter) updated to match the job-side keep-set WA/CA/TX/US-Remote:
+- **GEOGRAPHY prompt clause** (discovery extraction): "Greater Seattle" →
+  "Washington state (Seattle metro or anywhere in WA)", and companies hiring
+  TPMs into **US-remote roles** now qualify explicitly.
+- **`TAVILY_QUERIES`**: rebuilt as `_TAVILY_QUERY_BASES` (track content only)
+  + one uniform `_QUERY_GEO_TAIL` ("Washington state California Texas
+  remote") appended to every query by construction — no per-track geo
+  differentiation, exact match with the job-side keep-set. City anchors
+  (El Segundo, Seattle, Austin…) removed; example-company names carry the
+  search signal.
+- **Space-track regional enhancement** (`_SPACE_REGION_QUERIES`, +4 queries →
+  18 total): dedicated geo-targeted queries for the space industry's metro
+  clusters — Greater Seattle, SoCal (El Segundo/Hawthorne/Long Beach/
+  Torrance), Texas (Austin/Houston), and Florida (Cape Canaveral/Melbourne/
+  Space Coast). Outside the uniform-tail construction by design.
+
+### Florida as a Space-track-only target region (REQ-162)
+
+FL upgraded from discovery bait to a real target region, restricted to the
+Space track:
+- **`classify_region`** gains region "FL" (`", fl"` / "florida" /
+  unambiguous Space-Coast city hints; bare "melbourne" excluded — Australia
+  collision). Precedence WA > Remote > CA > TX > FL; sort tier groups FL
+  with CA/TX.
+- **New `job_agent._geo_out_of_scope(location, track)`** — single geo gate
+  shared by `_tpm_filter` and `_gate_and_finalize`: "FL" keeps only when
+  Track == "Space"; every other track treats FL like "Other". Both stages
+  covered, no track-agnostic leak.
+- **GEOGRAPHY extraction clause** (company discovery): Space-track companies
+  additionally qualify via Florida (Space Coast) hiring.
+
+Tests: +5 classes/cases (track-title matrix, WA-state matrix incl.
+false-positive guards, LLM rule split) — 1,145 passing.
+
+## 2026-08-19 (anti-oscillation + urls-only apply)
+
+### `--urls-only` + audit decision ledger
+
+Second live audit re-proposed reversals of track changes the user accepted
+the same day (NVIDIA, Tesla, Physical Intelligence flipped back; Aerospace
+Corp got a third answer) — Gemini oscillates on borderline companies even at
+temperature 0. Fixes:
+- **`--apply-audit --urls-only`**: apply only Y-approved URL suggestions,
+  skip every Track/Focus proposal. Used for this round (3 URLs applied:
+  Applied Digital, Zep AI, 6sense).
+- **Anti-oscillation ledger** (`logs/company_audit_ledger.json`): every
+  Track/Focus value applied via `--apply-audit` is recorded (focus as a
+  sha256 fingerprint); `--audit` suppresses re-proposals against a
+  user-confirmed value (noted in the row's Notes + a "Re-proposals
+  suppressed" counter). Suppression fires only while the cell still equals
+  the confirmed value — hand-editing a cell re-opens it, and deleting the
+  ledger file re-opens everything. Ledger seeded one-off with all 371
+  current Track/Focus values (the user-blessed 2026-08-19 state).
+Tests: +6 (`TestAuditAntiOscillation`, urls-only/ledger cases) — 474 in the
+touched files.
+
+## 2026-08-19 (URL correction loop)
+
+### `--suggest-urls` + approved-URL apply — the ongoing correction workflow
+
+Agreed workflow for Career URL quality from here on: pipeline runs never
+replace URLs (REQ-153) → periodic `--audit` → flagged rows get machine
+suggestions → the user approves per row → `--apply-audit` writes only
+approved cells. New pieces:
+- **`--suggest-urls`** (with `--audit`): rows whose flags mark the URL as
+  wrong (`POSTING_URL`/`AGGREGATOR`/`OWNERSHIP_MISMATCH`/`HTTP_FAIL`/`BLANK`;
+  informational `NON_ATS` only via `--suggest-non-ats`) get a
+  `_suggest_career_url` lookup — cheapest-first: deterministic posting-root
+  strip → KNOWN_CAREER_URLS → ATS slug probe with ownership evidence (free
+  HTTP) → Tavily ATS/general search → identity-gated homepage scrape. Every
+  candidate must differ from the current URL and pass the BUG-74/75/77
+  gates. Results land in three new audit columns: **Suggested URL**,
+  **URL Evidence** (e.g. "lever board 'goodco' — org name 'GoodCo', 7 live
+  jobs"), and an empty **Approve URL?**. `--suggest-limit N` caps lookups
+  (Tavily budget: ≤2 searches/row, slug probe costs none).
+- **`--apply-audit` extension**: a suggestion is written to Company_List
+  ONLY when the user typed Y/yes in "Approve URL?" — the sole sanctioned
+  Career URL write outside blank-row backfill; unapproved suggestions are
+  never applied. `get_audit_proposals` returns the new fields.
+Tests: +12 (`TestSuggestCareerUrl`, `TestRunCompanyAuditSuggestUrls`,
+approval cases in `TestApplyAudit`) — 462 passing in the touched files.
+
+**BUG-78** (found by the first live `--suggest-urls` run, which suggested
+Automattic's board for Zep AI, Chime's for Arista, Advance Auto Parts' /
+QVC's Workday for Akamai / Meta, an instahyre listing for Pure Storage, and
+a `/details/`-form Workday posting for F5): the Tavily result path — the
+ORIGINAL entry point of the wrong-URL bugs — had been left ungated by
+BUG-75. New `_tavily_result_matches_company` on every Tavily result: ATS
+boards → ownership check, Workday → subdomain equality, other hosts →
+company name must appear in the hostname or the domain core must lead the
+company name (never the reverse). Also: Workday `/details/` posting form
+added to the BUG-74 patterns; instahyre.com blocklisted. Applies to
+discovery and suggestions alike. Tests: +8 — 469 passing.
+
+## 2026-08-19 (later)
+
+### `--apply-audit` — user-approved audit proposals applied
+
+After reviewing `Company_Audit`, the user hand-corrected several Career URLs
+and deleted 9 companies in Company_List (their edits are authoritative and
+untouched), then approved the Track/Focus proposals. New
+`company_agent --apply-audit` (+ `apply_audit()`, `get_audit_proposals()` in
+excel_store): applies ONLY Track (`update_company_track`) and Business Focus
+(`update_company_business_focus`), matched by Company Name — never excel_row
+(sorts/deletions shift rows); Names + Career URLs never written; invalid
+buckets and since-deleted companies skipped; canonical Track sort last.
+Applied live: 27 track changes + 21 focus rewrites, 2 skipped (deleted
+companies); PayPal→Fintech proposal reverted to Mid-large Tech at apply time
+(deterministic legacy-incumbent taxonomy rule beats the model). Backup:
+`pathfinder_dashboard.backup-20260819.xlsx`. Verified post-apply: Name+URL
+set byte-identical to the user's hand-edited state; job-count columns
+preserved. Tests: +4 (`TestApplyAudit`), 448 targeted / suite green.
+
+Storage-layer hardening (same day): `upsert_companies` now preserves a
+FILLED Career URL on existing-row upserts (only blank/N-A cells accept a
+value) — previously discovery dedup was the only thing standing between a
+re-discovered name and a clobbered user-verified URL; the invariant now
+lives at the write layer where no upstream regression can bypass it
+(REQ-153). Two legacy tests asserting the old overwrite behavior updated;
++2 new (`TestUpsertNeverOverwritesFilledCareerUrl`).
+
+## 2026-08-19
+
+### Company-agent career-URL/track quality (BUG-74~77) + report-only `--audit`
+
+Trigger: the user manually verified all 380 Company_List rows and found three
+recurring company_agent defects — job-posting links stored as company career
+URLs, ATS board URLs "created" from slug guesses that belong to other
+companies, and inaccurate Track/Business Focus values.
+
+**Hard constraint honored throughout**: the 380 user-verified Company Name +
+Career URL values are never modified by any code path.
+
+**Fixes** (`agents/company_agent.py`):
+- **BUG-74** — `_is_job_posting_url` + `_posting_url_to_board_root`: per-ATS
+  posting-URL shapes (greenhouse `/jobs/<id>`+`gh_jid=`, lever/ashby UUID,
+  workable `/j/<id>`, workday `/job/`, generic numeric ids) rejected by
+  `_is_likely_career_url`; Tavily posting results are upgraded to their board
+  root; `validate_and_upgrade_ats_url` step 2 strips postings instead of
+  freezing them.
+- **BUG-75** — board OWNERSHIP verification: `_org_name_matches_company`
+  (equality-only compact matching; the Workday subdomain matcher now
+  delegates to it) + per-platform org-name fetch (greenhouse/workable JSON
+  `name`, lever/ashby board `<title>`); gate wired into `_find_ats_url` and
+  `validate_and_upgrade_ats_url`. `_slug_candidates` no longer emits bare
+  single words from multi-word names. Homepage guesses require the page to
+  identify as the company (`_homepage_belongs_to_company`).
+- **Phase 1.5 write guard** — `run_phase_1_5` now ONLY backfills blank
+  Career URLs; filled rows are never probed/overwritten (pre-fix it silently
+  rewrote every filled non-ATS URL each run).
+- **BUG-76** — discovery confidence gate: `CompanyInfo.confident` +
+  do-not-guess instruction; unconfident extractions blank Track/Focus for the
+  confident-gated repair paths to refill.
+- **BUG-77** — `_AGGREGATOR_HOSTS` hostname-suffix blocklist (builtin,
+  ycombinator, iitjobs, consider, wellfound, indeed, glassdoor, linkedin, …)
+  rejected at discovery; `jobs.gem.com` deliberately allowed (real ATS).
+- **`--audit` (report-only)** — batched Gemini re-evaluation of Track/
+  Business Focus for every row (20/batch ≈ 19 calls for 380 rows, zero
+  Tavily) + URL health flags into the transient `Company_Audit` tab
+  (`shared/excel_store.py: replace_audit_sheet`, create-or-replace). Never
+  writes Company_List. `--audit-limit N`, `--audit-skip-http` for dry runs.
+  Applying user-approved changes is a follow-up (`--apply-audit`, keyed by
+  Company Name; not built yet).
+
+**Tests**: 1104 passed / 1 skipped (+~55 new: posting detection/root
+stripping, ownership matching/fail-open semantics, slug tightening, homepage
+identity gate, phase-1.5 never-rewrites guard, discovery confident gate,
+audit report-only invariants, `replace_audit_sheet`).
+
 ## 2026-07-16
 
 ### Cross-process run lock + crash-proof workbook reads (BUG-73)

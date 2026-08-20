@@ -1,5 +1,41 @@
 # Task Tracker
 
+## Completed (2026-08-19): Filter widening — titles + WA geo (REQ-160/161)
+
+**Trigger**: user decision — leave more results at the cheap title/geo pre-filter; write-time gates keep final precision.
+
+- [x] `TPM_KW` + "Technical Project Manager" (+ mgr/tech variants) on all tracks
+- [x] `PM_TITLE_OK_TRACKS` (AI-native/Robotics/Space/Defense): plain "Program Manager" accepted in `_tpm_filter`; track threaded `process_company → discover_jobs → _discover_via_api`
+- [x] `llm_filter_jobs` three-way rule split (PM-OK vertical / Fintech / mid-large); mid-large also accepts Technical Project Manager
+- [x] Workday `searchText` + Firecrawl map query → "Program Manager"; Amazon/Google kept narrow (pagination-cap risk, documented in code)
+- [x] Geo: `classify_region` "Seattle" → "WA" (whole state via `,\s*wa\b` regex + state forms; bare "Washington"/D.C. still Other); keep-set WA/CA/TX/US-Remote; sort tier WA+Remote > CA/TX
+- [x] Tests: +track-title matrix, WA-state matrix (incl. Wales/D.C. false-positive guards), LLM rule split — full suite 1,145 passed / 1 skipped
+- [x] Docs: CHANGELOG, REQUIREMENTS (REQ-160/161, §9.13), ARCHITECTURE v2.2
+- [x] Company discovery aligned to WA/CA/TX/US-Remote: GEOGRAPHY prompt clause (WA state + US-remote qualification) + `TAVILY_QUERIES` rebuilt with uniform `_QUERY_GEO_TAIL` (no per-track geo differentiation); 233 company tests green
+- [x] Space-track regional enhancement: `_SPACE_REGION_QUERIES` (+4 geo-targeted queries: Greater Seattle / SoCal / TX / FL Space Coast, outside the uniform tail)
+- [x] REQ-162: FL = Space-track-only target region — `classify_region` "FL" (city hints, no bare "melbourne"), shared `_geo_out_of_scope(loc, track)` gate in `_tpm_filter` + `_gate_and_finalize`, GEOGRAPHY clause Space-FL exception, sort tier FL~CA/TX; full suite 1,149 passed / 1 skipped
+
+## In progress (2026-08-19): Company agent URL/track quality fixes (BUG-74~77) + staged Company_List audit
+
+**Plan**: `.claude/plans/twinkly-mixing-adleman.md` | **Trigger**: user manually verified all 380 Company_List rows; found job-posting-as-career-URL, guessed ATS URLs, inaccurate Track/Focus.
+**HARD CONSTRAINT**: the 380 Company Name + Career URL values are user-verified — never modified by any code path.
+
+- [x] BUG-74: `_is_job_posting_url` + `_posting_url_to_board_root`; wired into `_is_likely_career_url`, `_tavily_extract_career_url`, `validate_and_upgrade_ats_url` step 2
+- [x] BUG-77: `_AGGREGATOR_HOSTS` blocklist (suffix match; gem.com deliberately excluded — legit ATS) in `_is_likely_career_url`
+- [x] BUG-75: `_org_name_matches_company` (generalized Workday matcher) + per-ATS org-name fetch + ownership gate in `_find_ats_url`/`validate_and_upgrade_ats_url`; `_slug_candidates` drops bare single words for multi-word names; homepage identity gate
+- [x] Phase 1.5 write guard: filled non-ATS rows skipped (never rewritten) — was silently upgrading user-verified URLs every run
+- [x] BUG-76: `confident` field + do-not-guess clause in discovery; unconfident → blank track/focus → repair paths backfill
+- [x] Staged audit: `--audit` CLI → Gemini re-eval of Track/Focus (batches of 20, ~19 calls, zero Tavily) + URL health flags → `Company_Audit` tab only (`replace_audit_sheet` in excel_store); apply flow deferred until user reviews
+- [x] Tests: full suite 1104 passed / 1 skipped (+~55 new)
+- [x] Verify: dry-run (5 rows, skip-http) ✅; 15-row live ✅ (caught real wrong-company URL: Applied Digital → Apply Digital's lever board); full 380 running
+- [x] Docs: BUGS BUG-74~77, CHANGELOG, ARCHITECTURE, REQUIREMENTS v2.7 (REQ-153~157), CLAUDE.md
+- [x] Full 380-row audit ×2 (matcher refined between runs) + Company_List sha256 identical; final suite 1108 passed / 1 skipped
+- [x] Bonus fix found during verification: `_slug_candidates` str.replace(" corp") corrupted " corporation" names ("rocket laboration"); matcher now also compares dedup-normalized forms (Lambda Labs ↔ "Lambda") — mismatch flags 38→30
+- [x] Real wrong-company URLs surfaced (report-only, user decides): Applied Digital→Apply Digital's lever, Figure AI→Figure Lending, Runway→cfo.ai, Safe Superintelligence→Safe Security
+- [x] User approvals applied via `--apply-audit --urls-only` (Applied Digital / Zep AI / 6sense); oscillating track/focus re-proposals skipped per user choice; anti-oscillation ledger (REQ-159, logs/company_audit_ledger.json) seeded with all 371 rows; convergence proven — re-audit now proposes 0 track / 0 focus (16 suppressed); 474 tests green
+- [x] URL correction loop shipped (user-designed, REQ-158): `--suggest-urls` (+`--suggest-non-ats`, `--suggest-limit`) fills Suggested URL/Evidence/Approve columns for flagged rows; `--apply-audit` writes only Y-approved suggestions; +12 tests (462 green); upsert_companies storage-layer URL guard (+2 tests, 2 legacy tests updated to new invariant)
+- [x] `--apply-audit` shipped + run after user review (user hand-fixed URLs, deleted 9 cos): 27 track + 21 focus applied, 2 skipped-deleted; PayPal reverted to Mid-large Tech (taxonomy rule); Name+URL set verified identical to user's hand-edited state; backup pathfinder_dashboard.backup-20260819.xlsx
+
 ## Completed (2026-07-16): Concurrent-run collision fix (BUG-73)
 
 **Trigger**: manual `job_agent` run (09:57) crashed with EOFError — it overlapped the still-running 04:00 scheduled pipeline (6h long from company-agent API retries); the pipeline's match agent rewrote the xlsx mid-read. Both job agents also scraped the same 387 JDs (duplicate spend).

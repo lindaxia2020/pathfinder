@@ -715,7 +715,7 @@ class TestDiscoverJobsWorkdayFallback(unittest.IsolatedAsyncioTestCase):
         crawled_tpm = [{"url": "https://company.myworkdayjobs.com/job/tpm-ai", "title": "AI TPM"}]
 
         with patch("agents.job_agent._fetch_workday_jobs", return_value=[{"id": 1, "title": "SWE"}]), \
-             patch("agents.job_agent._tpm_filter", side_effect=lambda lst: crawled_tpm if lst == [] else []), \
+             patch("agents.job_agent._tpm_filter", side_effect=lambda lst, track="": crawled_tpm if lst == [] else []), \
              patch("agents.job_agent._crawl_page", new=AsyncMock(return_value=[])):
             # _tpm_filter returns [] for API jobs → should fall back to _crawl_page
             result = await discover_jobs(workday_url, MagicMock())
@@ -2375,7 +2375,8 @@ class TestParseIsoDate(unittest.TestCase):
 
 
 class TestTpmFilterGeo(unittest.TestCase):
-    """REQ-004-12: _tpm_filter keeps only Seattle/CA/TX/US-Remote."""
+    """REQ-004-12: _tpm_filter keeps only WA/CA/TX/US-Remote
+    (2026-08-19: Seattle metro widened to all of WA)."""
 
     @staticmethod
     def _links():
@@ -2387,12 +2388,80 @@ class TestTpmFilterGeo(unittest.TestCase):
             {"url": "u5", "title": "TPM", "location": "El Segundo, CA"},
             {"url": "u6", "title": "TPM", "location": ""},  # unknown → keep
             {"url": "u7", "title": "TPM", "location": "Boston, MA"},
+            {"url": "u8", "title": "TPM", "location": "Spokane, WA"},  # WA beyond Seattle metro
         ]
 
     def test_only_target_regions_kept(self):
         from agents.job_agent import _tpm_filter
         kept = {l["url"] for l in _tpm_filter(self._links())}
-        self.assertEqual(kept, {"u1", "u3", "u4", "u5", "u6"})
+        self.assertEqual(kept, {"u1", "u3", "u4", "u5", "u6", "u8"})
+
+
+class TestTpmFilterTrackTitles(unittest.TestCase):
+    """2026-08-19 title widening: 'technical project manager' accepted on all
+    tracks; plain 'program manager' only on PM_TITLE_OK_TRACKS
+    (AI-native/Robotics/Space/Defense) — not Fintech/Mid-large/blank."""
+
+    LINKS = [
+        {"url": "u1", "title": "Senior Technical Program Manager", "location": "Seattle, WA"},
+        {"url": "u2", "title": "Technical Project Manager", "location": "Seattle, WA"},
+        {"url": "u3", "title": "Program Manager, Launch Operations", "location": "Austin, TX"},
+        {"url": "u4", "title": "Product Manager", "location": "Seattle, WA"},
+        {"url": "u5", "title": "Software Engineer", "location": "Remote"},
+    ]
+
+    def _kept(self, track):
+        from agents.job_agent import _tpm_filter
+        return {l["url"] for l in _tpm_filter(self.LINKS, track)}
+
+    def test_technical_project_manager_accepted_everywhere(self):
+        for track in ("", "Mid-large Tech", "Fintech", "AI-native"):
+            self.assertIn("u2", self._kept(track), track)
+
+    def test_plain_program_manager_only_on_pm_ok_tracks(self):
+        for track in ("AI-native", "Robotics", "Space", "Defense"):
+            self.assertEqual(self._kept(track), {"u1", "u2", "u3"}, track)
+        for track in ("", "Mid-large Tech", "Fintech"):
+            self.assertEqual(self._kept(track), {"u1", "u2"}, track)
+
+    def test_default_track_is_strict(self):
+        from agents.job_agent import _tpm_filter
+        kept = {l["url"] for l in _tpm_filter(self.LINKS)}
+        self.assertNotIn("u3", kept)
+
+
+class TestSpaceTrackFloridaGeo(unittest.TestCase):
+    """REQ-162: FL locations are kept on the Space track only — in both
+    _tpm_filter (pre-scrape) and _gate_and_finalize (write time)."""
+
+    FL_LINK = {"url": "u1", "title": "Technical Program Manager",
+               "location": "Cape Canaveral, FL"}
+
+    def test_tpm_filter_keeps_fl_only_for_space(self):
+        from agents.job_agent import _tpm_filter
+        self.assertEqual(_tpm_filter([self.FL_LINK], "Space"), [self.FL_LINK])
+        for track in ("", "AI-native", "Defense", "Mid-large Tech"):
+            self.assertEqual(_tpm_filter([self.FL_LINK], track), [], track)
+
+    def _parsed(self):
+        return {"job_title": "Senior Technical Program Manager",
+                "company": "SpaceCo", "location": "Merritt Island, FL",
+                "job_domain": "Space", "min_yoe": 6,
+                "work_auth": "none_stated"}
+
+    def test_gate_keeps_fl_on_space_track(self):
+        from agents.job_agent import _gate_and_finalize
+        self.assertIsNotNone(_gate_and_finalize(
+            self._parsed(), "Space", "https://x.co/jd/1",
+            posted_date="2026-08-01"))
+
+    def test_gate_drops_fl_on_other_tracks(self):
+        from agents.job_agent import _gate_and_finalize
+        parsed = self._parsed()
+        parsed["job_domain"] = "Defense"
+        self.assertIsNone(_gate_and_finalize(
+            parsed, "Defense", "https://x.co/jd/2",
+            posted_date="2026-08-01"))
 
 
 class TestInternFilter(unittest.TestCase):
@@ -2713,6 +2782,24 @@ class TestLlmFilterJobsRuleSelection(unittest.TestCase):
         self.assertIn("five tracks", instr)
         self.assertIn("Project Kuiper", instr)
         self.assertIn("SECURITY:", instr)
+
+    # 2026-08-19 title widening
+    def test_pm_ok_vertical_accepts_program_manager(self):
+        instr = self._sys_instr("Space")
+        self.assertIn("Program Manager, and Technical Project Manager roles", instr)
+        self.assertNotIn("generic Program Manager", instr)
+
+    def test_fintech_vertical_rejects_generic_program_manager(self):
+        instr = self._sys_instr("Fintech")
+        self.assertIn("Fintech-track company", instr)
+        self.assertIn("generic Program Manager", instr)
+        self.assertIn("Technical Project Manager roles", instr)
+        self.assertNotIn("five tracks", instr)
+
+    def test_midlarge_accepts_technical_project_manager_only(self):
+        instr = self._sys_instr("Mid-large Tech")
+        self.assertIn("Technical Project Manager roles", instr)
+        self.assertIn("generic Program Manager", instr)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

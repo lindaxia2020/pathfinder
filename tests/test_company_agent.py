@@ -20,6 +20,7 @@ Integration tests (real network):
 """
 import sys
 import os
+import json
 import types as pytypes
 import unittest
 from unittest.mock import MagicMock, patch
@@ -174,6 +175,14 @@ class TestUnwrapCareerUrl(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 class TestValidateAndUpgradeUnwraps(unittest.TestCase):
     """A″ — validate_and_upgrade_ats_url must re-resolve wrapper URLs to real ATS."""
+
+    def setUp(self):
+        # BUG-75: the ownership gate does its own HTTP fetch — keep these
+        # tests offline and let every mocked slug hit count as owned.
+        p = patch("agents.company_agent._ats_board_belongs_to_company",
+                  return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def test_vc_wrapper_upgraded_when_underlying_is_on_greenhouse(self):
         # jobs.a16z.com/jobs/repl.it → probe slugs → greenhouse hit on first slug
@@ -488,6 +497,25 @@ class TestSlugCandidates(unittest.TestCase):
         self.assertIn("hugging-face", slugs)
         self.assertIn("huggingface", slugs)
 
+    def test_corporation_suffix_not_corrupted_by_corp_replace(self):
+        # BUG-75: str.replace(" corp") used to eat the front of
+        # " corporation" → "rocket laboration".
+        slugs = _slug_candidates("Rocket Lab Corporation")
+        self.assertIn("rocketlab", slugs)
+        self.assertNotIn("rocketlaboration", slugs)
+
+    def test_stacked_suffixes_stripped(self):
+        self.assertIn("acme", _slug_candidates("Acme Technologies Inc"))
+
+    def test_no_bare_single_words_from_multi_word_names(self):
+        # BUG-75: "physical" / "intelligence" are somebody's board — just not
+        # Physical Intelligence's. Bare word-grabs are collision magnets.
+        slugs = _slug_candidates("Physical Intelligence")
+        self.assertNotIn("physical", slugs)
+        self.assertNotIn("intelligence", slugs)
+        self.assertIn("physical-intelligence", slugs)
+        self.assertIn("physicalintelligence", slugs)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 class TestValidateCareerUrl(unittest.TestCase):
@@ -566,6 +594,13 @@ class TestCheckAtsSlug(unittest.TestCase):
 class TestFindAtsUrl(unittest.TestCase):
     """ATS URL discovery — _check_ats_slug and time.sleep are mocked."""
 
+    def setUp(self):
+        # BUG-75: keep the ownership gate's HTTP fetch out of these tests.
+        p = patch("agents.company_agent._ats_board_belongs_to_company",
+                  return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_anthropic_finds_greenhouse(self):
         def fake_check(slug, validator):
             if slug == "anthropic" and validator["platform"] == "greenhouse":
@@ -594,6 +629,14 @@ class TestFindAtsUrl(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 class TestTavilyExtractCareerUrl(unittest.TestCase):
     """Unit tests with mocked Tavily client."""
+
+    def setUp(self):
+        # BUG-78: identity checks do their own HTTP — mocked True here; the
+        # gate itself is tested in TestTavilyResultMatchesCompany.
+        p = patch("agents.company_agent._tavily_result_matches_company",
+                  return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     def _make_client(self, results):
         client = MagicMock()
@@ -637,6 +680,12 @@ class TestTavilyExtractCareerUrl(unittest.TestCase):
 class TestFindCareerUrlOrchestration(unittest.TestCase):
     """Unit test the full find_career_url strategy chain."""
 
+    def setUp(self):
+        p = patch("agents.company_agent._tavily_result_matches_company",
+                  return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_known_url_returned_first(self):
         """KNOWN_CAREER_URLS match should short-circuit everything."""
         mock_client = MagicMock()
@@ -679,8 +728,13 @@ class TestSchemaNoCareerUrl(unittest.TestCase):
 
     def test_required_fields_present(self):
         fields = AICompanyInfo.model_fields
-        for f in ["company_name", "track", "business_focus"]:
+        for f in ["company_name", "track", "business_focus", "confident"]:
             self.assertIn(f, fields)
+
+    def test_confident_description_says_do_not_guess(self):
+        # BUG-76: the discovery schema must carry the do-not-guess gate.
+        desc = AICompanyInfo.model_fields["confident"].description
+        self.assertIn("do not guess", desc)
 
     def test_business_focus_description_mentions_sentences(self):
         desc = AICompanyInfo.model_fields["business_focus"].description
@@ -691,7 +745,8 @@ class TestSchemaNoCareerUrl(unittest.TestCase):
             company_name="TestCo",
             track="AI-native",
             business_focus="TestCo builds AI tools. They serve enterprise customers. "
-                           "Their edge is speed. They raised $200M in 2025."
+                           "Their edge is speed. They raised $200M in 2025.",
+            confident=True,
         )
         self.assertEqual(obj.company_name, "TestCo")
         self.assertFalse(hasattr(obj, "career_url"))
@@ -1023,6 +1078,7 @@ class TestTrackWhitelist(unittest.TestCase):
             company_name="Anduril",
             track="Defense",
             business_focus="Defense AI products for the US military and allies.",
+            confident=True,
         )
         self.assertEqual(info.track, "Defense")
 
@@ -1572,6 +1628,992 @@ class TestRunEnrichMissingTracks(unittest.TestCase):
                         source.index("run_enrich_missing_tracks"))
         self.assertLess(source.index("run_enrich_missing_tracks"),
                         source.index("sort_company_list_by_track"))
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-74 — job-posting URLs must never be stored as career URLs
+# ═════════════════════════════════════════════════════════════════════════════
+class TestIsJobPostingUrl(unittest.TestCase):
+
+    def test_greenhouse_posting_path(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160"))
+
+    def test_greenhouse_embedded_gh_jid(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://www.example.com/careers?gh_jid=123456"))
+
+    def test_lever_posting_uuid(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://jobs.lever.co/palantir/9f8e7d6c-1a2b-3c4d-5e6f-7a8b9c0d1e2f"))
+
+    def test_ashby_posting_uuid(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://jobs.ashbyhq.com/openai/12345678-abcd-ef01-2345-6789abcdef01"))
+
+    def test_workable_posting(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://apply.workable.com/huggingface/j/ABC123DEF4/"))
+
+    def test_workday_posting(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/Senior-TPM_JR123"))
+
+    def test_generic_numeric_job_id(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(
+            "https://careers.example.com/jobs/574115"))
+
+    def test_board_roots_are_not_postings(self):
+        for url in ["https://job-boards.greenhouse.io/cloudflare",
+                    "https://jobs.lever.co/palantir",
+                    "https://jobs.ashbyhq.com/openai",
+                    "https://apply.workable.com/huggingface/",
+                    "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
+                    "https://www.anthropic.com/careers"]:
+            self.assertFalse(company_agent_mod._is_job_posting_url(url), url)
+
+
+class TestPostingUrlToBoardRoot(unittest.TestCase):
+
+    def test_greenhouse_root(self):
+        self.assertEqual(
+            company_agent_mod._posting_url_to_board_root(
+                "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160"),
+            "https://job-boards.greenhouse.io/cloudflare")
+
+    def test_lever_root(self):
+        self.assertEqual(
+            company_agent_mod._posting_url_to_board_root(
+                "https://jobs.lever.co/palantir/9f8e7d6c-1a2b-3c4d-5e6f-7a8b9c0d1e2f"),
+            "https://jobs.lever.co/palantir")
+
+    def test_workday_truncates_at_job_keeping_site(self):
+        self.assertEqual(
+            company_agent_mod._posting_url_to_board_root(
+                "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite/job/US-CA/Senior-TPM_JR123"),
+            "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite")
+
+    def test_embedded_gh_jid_has_no_derivable_root(self):
+        self.assertIsNone(company_agent_mod._posting_url_to_board_root(
+            "https://www.example.com/careers?gh_jid=123456"))
+
+    def test_non_posting_returns_none(self):
+        self.assertIsNone(company_agent_mod._posting_url_to_board_root(
+            "https://jobs.lever.co/palantir"))
+
+
+class TestIsLikelyCareerUrlRejectsPostingsAndAggregators(unittest.TestCase):
+    """BUG-74/77 negatives that were missing from TestIsLikelyCareerUrl."""
+
+    def test_greenhouse_posting_rejected(self):
+        self.assertFalse(_is_likely_career_url(
+            "https://job-boards.greenhouse.io/intrinsicrobotics/jobs/5741158004"))
+
+    def test_aggregator_rejected(self):
+        for url in ["https://builtin.com/company/c3-ai/jobs",
+                    "https://www.iitjobs.com/jobs/Adept%20AI-jobs-careers-29697",
+                    "https://www.ycombinator.com/companies/zep-ai/jobs",
+                    "https://www.linkedin.com/company/kuka/jobs"]:
+            self.assertFalse(_is_likely_career_url(url), url)
+
+    def test_gem_boards_still_accepted(self):
+        # Gem is a real ATS (user-verified boards exist) — deliberately NOT
+        # blocklisted.
+        self.assertTrue(_is_likely_career_url("https://jobs.gem.com/groq"))
+
+    def test_aggregator_host_suffix_not_substring(self):
+        # "builtin.com" must not reject an unrelated host containing the text.
+        self.assertTrue(_is_likely_career_url("https://rebuiltin.company.com/careers"))
+
+
+class TestTavilyExtractUpgradesPostings(unittest.TestCase):
+    """BUG-74: a Tavily posting-URL result is upgraded to its board root."""
+
+    def setUp(self):
+        p = patch("agents.company_agent._tavily_result_matches_company",
+                  return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_posting_result_returns_board_root(self):
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"url": "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160"},
+        ]}
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            result = _tavily_extract_career_url("Cloudflare", "query", client)
+        self.assertEqual(result, "https://job-boards.greenhouse.io/cloudflare")
+
+    def test_underivable_posting_skipped(self):
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"url": "https://www.example.com/careers?gh_jid=123456"},
+        ]}
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            result = _tavily_extract_career_url("Example", "query", client)
+        self.assertIsNone(result)
+
+    def test_aggregator_result_skipped(self):
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"url": "https://builtin.com/company/c3-ai/jobs"},
+        ]}
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            result = _tavily_extract_career_url("C3 AI", "query", client)
+        self.assertIsNone(result)
+
+
+class TestValidateAndUpgradePostingUrl(unittest.TestCase):
+    """BUG-74: posting URLs on ATS domains must not be frozen by step 2."""
+
+    def test_posting_url_stripped_to_validated_root(self):
+        with patch("agents.company_agent.validate_career_url", return_value=True):
+            result = validate_and_upgrade_ats_url(
+                "Cloudflare",
+                "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160")
+        self.assertEqual(result, "https://job-boards.greenhouse.io/cloudflare")
+
+    def test_posting_url_kept_when_root_unreachable(self):
+        with patch("agents.company_agent.validate_career_url", return_value=False):
+            result = validate_and_upgrade_ats_url(
+                "Cloudflare",
+                "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160")
+        self.assertEqual(
+            result,
+            "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160")
+
+    def test_genuine_board_url_still_short_circuits(self):
+        with patch("agents.company_agent._check_ats_slug") as mock_check:
+            result = validate_and_upgrade_ats_url(
+                "OpenAI", "https://jobs.ashbyhq.com/openai")
+        self.assertEqual(result, "https://jobs.ashbyhq.com/openai")
+        mock_check.assert_not_called()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-75 — board ownership verification
+# ═════════════════════════════════════════════════════════════════════════════
+class TestOrgNameMatchesCompany(unittest.TestCase):
+
+    def test_exact_match(self):
+        self.assertTrue(company_agent_mod._org_name_matches_company("Stripe", "Stripe"))
+
+    def test_title_noise_stripped(self):
+        self.assertTrue(company_agent_mod._org_name_matches_company("OpenAI Jobs", "OpenAI"))
+        self.assertTrue(company_agent_mod._org_name_matches_company("Careers at Stripe", "Stripe"))
+
+    def test_suffix_variants_match(self):
+        self.assertTrue(company_agent_mod._org_name_matches_company(
+            "Palantir Technologies", "Palantir"))
+
+    def test_different_company_rejected(self):
+        self.assertFalse(company_agent_mod._org_name_matches_company(
+            "Physical Therapy Partners", "Physical Intelligence"))
+
+    def test_normalized_suffix_words_match(self):
+        # Real 380-row audit cases: board named without the generic suffix.
+        self.assertTrue(company_agent_mod._org_name_matches_company(
+            "Lambda Jobs", "Lambda Labs"))
+        self.assertTrue(company_agent_mod._org_name_matches_company(
+            "Vannevar", "Vannevar Labs"))
+        self.assertTrue(company_agent_mod._org_name_matches_company(
+            "Rocket Lab Corporation", "Rocket Lab"))
+
+    def test_real_wrong_company_boards_stay_rejected(self):
+        # Real catches from the 380-row audit — must never regress to True.
+        self.assertFalse(company_agent_mod._org_name_matches_company(
+            "Figure Lending", "Figure AI"))
+        self.assertFalse(company_agent_mod._org_name_matches_company(
+            "cfo.ai Jobs", "Runway"))
+        self.assertFalse(company_agent_mod._org_name_matches_company(
+            "Safe Security", "Safe Superintelligence"))
+        self.assertFalse(company_agent_mod._org_name_matches_company(
+            "APPLY", "Applied Digital"))
+
+    def test_no_substring_leakage(self):
+        # The Workday comment's exact leak cases must stay rejected.
+        self.assertFalse(company_agent_mod._org_name_matches_company("applebank", "Apple"))
+        self.assertFalse(company_agent_mod._org_name_matches_company("westernunion", "Western"))
+
+    def test_empty_inputs_rejected(self):
+        self.assertFalse(company_agent_mod._org_name_matches_company("", "Stripe"))
+        self.assertFalse(company_agent_mod._org_name_matches_company("Stripe", ""))
+
+
+class TestAtsBoardOwnership(unittest.TestCase):
+    _GH = next(v for v in company_agent_mod.ATS_VALIDATORS if v["platform"] == "greenhouse")
+    _LEVER = next(v for v in company_agent_mod.ATS_VALIDATORS if v["platform"] == "lever")
+
+    def _resp(self, status=200, json_data=None, text=""):
+        r = MagicMock()
+        r.status_code = status
+        r.json.return_value = json_data or {}
+        r.text = text
+        return r
+
+    def test_org_api_match_accepted(self):
+        with patch("agents.company_agent.requests.get",
+                   return_value=self._resp(json_data={"name": "Cloudflare"})):
+            self.assertTrue(company_agent_mod._ats_board_belongs_to_company(
+                "cloudflare", self._GH, "Cloudflare"))
+
+    def test_org_api_mismatch_rejected(self):
+        with patch("agents.company_agent.requests.get",
+                   return_value=self._resp(json_data={"name": "Physical Therapy Partners"})):
+            self.assertFalse(company_agent_mod._ats_board_belongs_to_company(
+                "physical", self._GH, "Physical Intelligence"))
+
+    def test_org_html_title_match(self):
+        html = "<html><head><title>Palantir Technologies</title></head></html>"
+        with patch("agents.company_agent.requests.get",
+                   return_value=self._resp(text=html)):
+            self.assertTrue(company_agent_mod._ats_board_belongs_to_company(
+                "palantir", self._LEVER, "Palantir"))
+
+    def test_fetch_error_fails_open(self):
+        with patch("agents.company_agent.requests.get",
+                   side_effect=Exception("timeout")):
+            self.assertTrue(company_agent_mod._ats_board_belongs_to_company(
+                "anything", self._GH, "AnyCo"))
+
+    def test_noise_only_title_fails_open(self):
+        html = "<html><head><title>Jobs</title></head></html>"
+        with patch("agents.company_agent.requests.get",
+                   return_value=self._resp(text=html)):
+            self.assertTrue(company_agent_mod._ats_board_belongs_to_company(
+                "someco", self._LEVER, "SomeCo"))
+
+
+class TestFindAtsUrlOwnershipGate(unittest.TestCase):
+
+    def test_owned_by_other_company_skipped(self):
+        # Board exists for the bare slug but belongs to someone else → no URL.
+        with patch("agents.company_agent._check_ats_slug", return_value=(True, 9)), \
+             patch("agents.company_agent._ats_board_belongs_to_company",
+                   return_value=False), \
+             patch("agents.company_agent.time.sleep"):
+            url = company_agent_mod._find_ats_url("Physical Intelligence")
+        self.assertIsNone(url)
+
+
+class TestScrapeHomepageIdentityGate(unittest.TestCase):
+
+    def test_title_with_company_name_accepted(self):
+        html = "<html><head><title>Abridge | AI for clinical conversations</title></head></html>"
+        self.assertTrue(company_agent_mod._homepage_belongs_to_company(html, "Abridge"))
+
+    def test_unrelated_site_rejected(self):
+        html = "<html><head><title>Aether Group — Real Estate Holdings</title></head></html>"
+        # 'aether' appears, so this specific guess passes (documented limit) —
+        # but a fully unrelated title must fail:
+        html2 = "<html><head><title>Sunrise Dental Clinic</title></head></html>"
+        self.assertFalse(company_agent_mod._homepage_belongs_to_company(html2, "Aether"))
+
+    def test_og_site_name_accepted(self):
+        html = ('<html><head><title>Home</title>'
+                '<meta property="og:site_name" content="Scale AI"/></head></html>')
+        self.assertTrue(company_agent_mod._homepage_belongs_to_company(html, "Scale AI"))
+
+    def test_no_title_rejected(self):
+        self.assertFalse(company_agent_mod._homepage_belongs_to_company(
+            "<html><body>hi</body></html>", "Abridge"))
+
+    def test_scrape_skips_unidentified_homepage(self):
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.text = "<html><head><title>Totally Different Co</title></head><body><a href='/careers'>Careers</a></body></html>"
+        resp.url = "https://www.abridge.com"
+        with patch("agents.company_agent.requests.get", return_value=resp), \
+             patch("agents.company_agent.validate_career_url", return_value=True):
+            url = company_agent_mod._scrape_homepage_for_career_link("Abridge")
+        self.assertIsNone(url)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-74/75 — phase 1.5 never rewrites filled Career URLs (user-verified data)
+# ═════════════════════════════════════════════════════════════════════════════
+class TestPhase15NeverRewritesFilledRows(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        # Filled non-ATS URL (previously probed-and-overwritten every run).
+        ws.append(["VerifiedCo", "AI-native", None,
+                   "https://www.verifiedco.com/careers", None, None, None, None, None])
+        # Filled posting URL on an ATS domain (previously frozen; now merely
+        # skipped — the audit flags it).
+        ws.append(["PostingCo", "AI-native", None,
+                   "https://job-boards.greenhouse.io/postingco/jobs/1234567",
+                   None, None, None, None, None])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def test_filled_rows_untouched_even_when_upgrade_exists(self):
+        with patch("agents.company_agent.validate_and_upgrade_ats_url") as mock_upgrade, \
+             patch("agents.company_agent.update_company_career_url") as mock_write:
+            mock_upgrade.return_value = "https://jobs.lever.co/verifiedco"
+            company_agent_mod.run_phase_1_5(self.path, tavily_client=MagicMock())
+        mock_upgrade.assert_not_called()
+        mock_write.assert_not_called()
+
+    def test_blank_row_backfill_still_works_alongside_filled_rows(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path)
+        wb["Company_List"].append(
+            ["ManualCo", "Robotics", None, None, None, None, None, None, None])
+        wb.save(self.path)
+        wb.close()
+        with patch("agents.company_agent.find_career_url",
+                   return_value="https://jobs.lever.co/manualco") as mock_find:
+            company_agent_mod.run_phase_1_5(self.path, tavily_client=MagicMock())
+        mock_find.assert_called_once()
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        rows = {r[0]: r[3] for r in wb["Company_List"].iter_rows(min_row=2, values_only=True) if r[0]}
+        wb.close()
+        self.assertEqual(rows["ManualCo"], "https://jobs.lever.co/manualco")
+        self.assertEqual(rows["VerifiedCo"], "https://www.verifiedco.com/careers")
+        self.assertEqual(rows["PostingCo"],
+                         "https://job-boards.greenhouse.io/postingco/jobs/1234567")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-76 — discovery confident gate blanks unconfident Track/Focus
+# ═════════════════════════════════════════════════════════════════════════════
+class TestDiscoveryConfidentGate(unittest.TestCase):
+
+    def test_unconfident_rows_blanked_after_bucket_rules(self):
+        resp = MagicMock()
+        resp.text = json.dumps({"companies": [
+            {"company_name": "SureCo", "track": "AI-native",
+             "business_focus": "SureCo builds X.", "confident": True},
+            {"company_name": "GuessCo", "track": "AI-native",
+             "business_focus": "guessed text", "confident": False},
+        ]})
+        pool = MagicMock()
+        pool.generate_content.return_value = resp
+        client = MagicMock()
+        client.search.return_value = {"results": []}
+        with patch.object(company_agent_mod, "_KEY_POOL", pool), \
+             patch("agents.company_agent.find_career_url",
+                   return_value="https://jobs.lever.co/x"), \
+             patch("agents.company_agent.time.sleep"):
+            out = company_agent_mod.discover_ai_companies(
+                client, set(), {"AI-native": 5})
+        by_name = {c["company_name"]: c for c in out}
+        self.assertEqual(by_name["SureCo"]["track"], "AI-native")
+        self.assertEqual(by_name["GuessCo"]["track"], "")
+        self.assertEqual(by_name["GuessCo"]["business_focus"], "")
+
+    def test_discovery_prompt_contains_do_not_guess(self):
+        import inspect
+        source = inspect.getsource(company_agent_mod.discover_ai_companies)
+        self.assertIn("do not guess", source)
+        self.assertIn("confident=false", source)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-74~77 — --audit is report-only
+# ═════════════════════════════════════════════════════════════════════════════
+def _isolate_ledger(testcase):
+    """Point the anti-oscillation ledger at a per-test temp file."""
+    import tempfile
+    fd, ledger_path = tempfile.mkstemp(suffix=".json")
+    os.close(fd)
+    os.remove(ledger_path)
+    p = patch.object(company_agent_mod, "_AUDIT_LEDGER_PATH", ledger_path)
+    p.start()
+    testcase.addCleanup(p.stop)
+    testcase.addCleanup(lambda: os.path.exists(ledger_path) and os.remove(ledger_path))
+    return ledger_path
+
+
+class TestRunCompanyAudit(unittest.TestCase):
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        self.ledger_path = _isolate_ledger(self)
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.append(["GoodCo", "AI-native", "GoodCo builds AI tools.",
+                   "https://jobs.lever.co/goodco", None, 0, 0, 0, "No"])
+        ws.append(["WrongTrackCo", "AI-native", "WrongTrackCo makes rockets.",
+                   "https://job-boards.greenhouse.io/wrongtrackco/jobs/1234567",
+                   None, 0, 0, 0, "No"])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _pool(self, items):
+        resp = MagicMock()
+        resp.text = json.dumps({"items": items})
+        pool = MagicMock()
+        pool.generate_content.return_value = resp
+        return pool
+
+    def _run(self, items, **kwargs):
+        pool = self._pool(items)
+        with patch.object(company_agent_mod, "_KEY_POOL", pool), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+             patch("agents.company_agent.update_company_track") as mock_track, \
+             patch("agents.company_agent.update_company_business_focus") as mock_focus, \
+             patch("agents.company_agent.update_company_career_url") as mock_url, \
+             patch("agents.company_agent.time.sleep"):
+            stats = company_agent_mod.run_company_audit(
+                self.path, skip_http=True, **kwargs)
+        mock_track.assert_not_called()
+        mock_focus.assert_not_called()
+        mock_url.assert_not_called()
+        return stats
+
+    def _audit_rows(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        ws = wb["Company_Audit"]
+        rows = list(ws.iter_rows(values_only=True))
+        wb.close()
+        return rows
+
+    def test_writes_audit_tab_and_never_touches_company_list(self):
+        import openpyxl
+        from shared.excel_store import AUDIT_HEADERS, get_company_rows
+        before = get_company_rows(self.path)
+        stats = self._run([
+            {"company_name": "GoodCo", "track": "AI-native", "track_confident": True,
+             "focus_accurate": True, "proposed_focus": "", "focus_confident": True,
+             "notes": "looks right"},
+            {"company_name": "WrongTrackCo", "track": "Space", "track_confident": True,
+             "focus_accurate": True, "proposed_focus": "", "focus_confident": True,
+             "notes": "rockets = Space"},
+        ])
+        self.assertEqual(stats["audited"], 2)
+        self.assertEqual(stats["track_changes"], 1)
+        self.assertEqual(get_company_rows(self.path), before)  # byte-identical data
+        rows = self._audit_rows()
+        self.assertEqual(list(rows[0]), AUDIT_HEADERS)
+        by_name = {r[0]: r for r in rows[1:]}
+        self.assertEqual(by_name["WrongTrackCo"][2], "Space")       # proposed track
+        self.assertEqual(by_name["WrongTrackCo"][3], "YES")
+        self.assertIn(by_name["GoodCo"][2], (None, ""))             # no change
+        # posting URL flagged with derivable root even with skip_http
+        self.assertIn("POSTING_URL", by_name["WrongTrackCo"][7])
+
+    def test_unconfident_results_propose_nothing(self):
+        self._run([
+            {"company_name": "GoodCo", "track": "Space", "track_confident": False,
+             "focus_accurate": False, "proposed_focus": "guessed", "focus_confident": False,
+             "notes": "unknown company"},
+            {"company_name": "WrongTrackCo", "track": "Space", "track_confident": True,
+             "focus_accurate": True, "proposed_focus": "", "focus_confident": True,
+             "notes": ""},
+        ])
+        by_name = {r[0]: r for r in self._audit_rows()[1:]}
+        self.assertIn(by_name["GoodCo"][2], (None, ""))  # unconfident track → blank
+        self.assertIn(by_name["GoodCo"][5], (None, ""))  # unconfident focus → blank
+        self.assertIn("NO", by_name["GoodCo"][8])    # confidence column says NO
+
+    def test_hallucinated_name_dropped_and_marked_rerun(self):
+        self._run([
+            {"company_name": "TotallyMadeUpCo", "track": "Space", "track_confident": True,
+             "focus_accurate": False, "proposed_focus": "x", "focus_confident": True,
+             "notes": "hallucinated"},
+        ])
+        by_name = {r[0]: r for r in self._audit_rows()[1:]}
+        self.assertNotIn("TotallyMadeUpCo", by_name)
+        self.assertIn("re-run", by_name["GoodCo"][9])
+
+    def test_limit_honored(self):
+        stats = self._run([
+            {"company_name": "GoodCo", "track": "AI-native", "track_confident": True,
+             "focus_accurate": True, "proposed_focus": "", "focus_confident": True,
+             "notes": ""},
+        ], limit=1)
+        self.assertEqual(stats["audited"], 1)
+        self.assertEqual(len(self._audit_rows()) - 1, 1)
+
+    def test_rerun_replaces_audit_tab(self):
+        items = [
+            {"company_name": "GoodCo", "track": "AI-native", "track_confident": True,
+             "focus_accurate": True, "proposed_focus": "", "focus_confident": True,
+             "notes": ""},
+        ]
+        self._run(items, limit=1)
+        self._run(items, limit=1)
+        self.assertEqual(len(self._audit_rows()) - 1, 1)  # replaced, not appended
+
+
+class TestAuditUrlFlags(unittest.TestCase):
+
+    def test_posting_flag_with_root(self):
+        flags = company_agent_mod._audit_url_flags(
+            "Cloudflare",
+            "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160",
+            skip_http=True)
+        self.assertTrue(any(f.startswith("POSTING_URL(→") for f in flags))
+
+    def test_aggregator_flag(self):
+        flags = company_agent_mod._audit_url_flags(
+            "C3 AI", "https://builtin.com/company/c3-ai/jobs", skip_http=True)
+        self.assertIn("AGGREGATOR", flags)
+
+    def test_vc_wrapper_flagged_as_aggregator(self):
+        flags = company_agent_mod._audit_url_flags(
+            "Hadrian", "https://jobs.a16z.com/jobs/hadrian", skip_http=True)
+        self.assertIn("AGGREGATOR", flags)
+
+    def test_clean_ats_board_no_flags(self):
+        flags = company_agent_mod._audit_url_flags(
+            "GoodCo", "https://jobs.lever.co/goodco", skip_http=True)
+        self.assertEqual(flags, [])
+
+    def test_non_ats_informational(self):
+        flags = company_agent_mod._audit_url_flags(
+            "Tesla", "https://www.tesla.com/careers", skip_http=True)
+        self.assertEqual(flags, ["NON_ATS"])
+
+    def test_blank_url(self):
+        self.assertEqual(company_agent_mod._audit_url_flags("X", "", skip_http=True),
+                         ["BLANK"])
+
+    def test_ownership_mismatch_flag_with_http(self):
+        with patch("agents.company_agent._ats_board_belongs_to_company",
+                   return_value=False), \
+             patch("agents.company_agent.validate_career_url", return_value=True):
+            flags = company_agent_mod._audit_url_flags(
+                "Physical Intelligence",
+                "https://job-boards.greenhouse.io/physical", skip_http=False)
+        self.assertIn("OWNERSHIP_MISMATCH", flags)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-78 — Tavily search results must pass the same identity checks
+# ═════════════════════════════════════════════════════════════════════════════
+class TestTavilyResultMatchesCompany(unittest.TestCase):
+
+    def test_ats_board_delegates_to_ownership_check(self):
+        with patch("agents.company_agent._ats_board_belongs_to_company",
+                   return_value=False) as mock_own:
+            ok = company_agent_mod._tavily_result_matches_company(
+                "https://job-boards.greenhouse.io/automatticcareers", "Zep AI")
+        self.assertFalse(ok)
+        self.assertEqual(mock_own.call_args.args[0], "automatticcareers")
+
+    def test_workday_subdomain_mismatch_rejected(self):
+        # Live case: "Akamai" query returned Advance Auto Parts' Workday.
+        self.assertFalse(company_agent_mod._tavily_result_matches_company(
+            "https://advanceauto.wd5.myworkdayjobs.com/en-US/AdvanceExternalCareers",
+            "Akamai Technologies"))
+
+    def test_workday_subdomain_match_accepted(self):
+        self.assertTrue(company_agent_mod._tavily_result_matches_company(
+            "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite",
+            "NVIDIA"))
+
+    def test_non_ats_hostname_must_contain_company(self):
+        self.assertTrue(company_agent_mod._tavily_result_matches_company(
+            "https://careers.doordash.com/", "DoorDash"))
+        self.assertTrue(company_agent_mod._tavily_result_matches_company(
+            "https://www.cadence.com/en_US/home/careers.html",
+            "Cadence Design Systems"))
+        # Live case: "Pure Storage" query returned an instahyre listing.
+        self.assertFalse(company_agent_mod._tavily_result_matches_company(
+            "https://www.instahyre.com/jobs-at-pure-storage", "Pure Storage"))
+
+    def test_wrong_company_board_result_skipped_end_to_end(self):
+        client = MagicMock()
+        client.search.return_value = {"results": [
+            {"url": "https://job-boards.greenhouse.io/chime"},   # not Arista's
+        ]}
+        with patch("agents.company_agent._ats_board_belongs_to_company",
+                   return_value=False), \
+             patch("agents.company_agent.validate_career_url", return_value=True):
+            result = _tavily_extract_career_url("Arista Networks", "q", client)
+        self.assertIsNone(result)
+
+
+class TestWorkdayDetailsPostingForm(unittest.TestCase):
+    """BUG-78: newer Workday CxS posting URLs use /details/ not /job/."""
+
+    _URL = ("https://ffive.wd5.myworkdayjobs.com/en-US/f5jobs/details/"
+            "NGINX-Enterprise-Account-Engineer_RP1029028?q=Nginx")
+
+    def test_details_form_is_a_posting(self):
+        self.assertTrue(company_agent_mod._is_job_posting_url(self._URL))
+
+    def test_details_form_root(self):
+        self.assertEqual(company_agent_mod._posting_url_to_board_root(self._URL),
+                         "https://ffive.wd5.myworkdayjobs.com/en-US/f5jobs")
+
+
+class TestSuggestCareerUrl(unittest.TestCase):
+    """--suggest-urls lookup: cheapest-first, evidence-carrying, gated."""
+
+    def test_posting_url_suggests_board_root_deterministically(self):
+        with patch("agents.company_agent.validate_career_url", return_value=True), \
+             patch("agents.company_agent._check_ats_slug") as mock_probe:
+            url, ev = company_agent_mod._suggest_career_url(
+                "Cloudflare",
+                "https://job-boards.greenhouse.io/cloudflare/jobs/7770160?gh_jid=7770160")
+        self.assertEqual(url, "https://job-boards.greenhouse.io/cloudflare")
+        self.assertIn("board root", ev)
+        mock_probe.assert_not_called()  # no probing needed — deterministic
+
+    def test_slug_probe_with_ownership_evidence(self):
+        def fake_check(slug, validator):
+            return (slug == "goodco" and validator["platform"] == "lever", 7)
+        with patch("agents.company_agent._check_ats_slug", side_effect=fake_check), \
+             patch("agents.company_agent._fetch_ats_org_name", return_value="GoodCo"), \
+             patch("agents.company_agent.time.sleep"):
+            url, ev = company_agent_mod._suggest_career_url(
+                "GoodCo", "https://builtin.com/company/goodco/jobs")
+        self.assertEqual(url, "https://jobs.lever.co/goodco")
+        self.assertIn("GoodCo", ev)
+        self.assertIn("7 live job", ev)
+
+    def test_wrong_owner_board_not_suggested(self):
+        with patch("agents.company_agent._check_ats_slug", return_value=(True, 5)), \
+             patch("agents.company_agent._fetch_ats_org_name",
+                   return_value="Somebody Else Entirely"), \
+             patch("agents.company_agent._scrape_homepage_for_career_link",
+                   return_value=None), \
+             patch("agents.company_agent.time.sleep"):
+            url, ev = company_agent_mod._suggest_career_url(
+                "GoodCo", "https://builtin.com/company/goodco/jobs")
+        self.assertIsNone(url)
+
+    def test_suggestion_equal_to_current_url_rejected(self):
+        # Board root == current URL → nothing to suggest via that strategy.
+        def fake_check(slug, validator):
+            return (slug == "goodco" and validator["platform"] == "lever", 7)
+        with patch("agents.company_agent._check_ats_slug", side_effect=fake_check), \
+             patch("agents.company_agent._fetch_ats_org_name", return_value="GoodCo"), \
+             patch("agents.company_agent._scrape_homepage_for_career_link",
+                   return_value=None), \
+             patch("agents.company_agent.time.sleep"):
+            url, ev = company_agent_mod._suggest_career_url(
+                "GoodCo", "https://jobs.lever.co/goodco/")  # same, trailing slash
+        self.assertIsNone(url)
+
+    def test_tavily_skipped_without_client(self):
+        with patch("agents.company_agent._check_ats_slug", return_value=(False, 0)), \
+             patch("agents.company_agent._tavily_extract_career_url") as mock_tav, \
+             patch("agents.company_agent._scrape_homepage_for_career_link",
+                   return_value=None), \
+             patch("agents.company_agent.time.sleep"):
+            url, _ = company_agent_mod._suggest_career_url(
+                "NoWhereCo", "https://builtin.com/x", tavily_client=None)
+        self.assertIsNone(url)
+        mock_tav.assert_not_called()
+
+
+class TestRunCompanyAuditSuggestUrls(unittest.TestCase):
+    """suggest_urls wiring: only actionable-flag rows get lookups by default."""
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        self.ledger_path = _isolate_ledger(self)
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.append(["AggCo", "AI-native", "f", "https://builtin.com/company/aggco",
+                   None, 0, 0, 0, "No"])       # AGGREGATOR → suggested
+        ws.append(["CleanCo", "AI-native", "f", "https://jobs.lever.co/cleanco",
+                   None, 0, 0, 0, "No"])       # no flags → no lookup
+        ws.append(["SiteCo", "AI-native", "f", "https://siteco.com/careers",
+                   None, 0, 0, 0, "No"])       # NON_ATS only → opt-in
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _run(self, **kwargs):
+        resp = MagicMock()
+        resp.text = json.dumps({"items": []})
+        pool = MagicMock()
+        pool.generate_content.return_value = resp
+        with patch.object(company_agent_mod, "_KEY_POOL", pool), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+             patch("agents.company_agent.build_tavily_pool_from_env",
+                   return_value=None), \
+             patch("agents.company_agent._suggest_career_url",
+                   return_value=("https://jobs.lever.co/found", "evidence")) as mock_s, \
+             patch("agents.company_agent.time.sleep"):
+            stats = company_agent_mod.run_company_audit(
+                self.path, skip_http=True, suggest_urls=True, **kwargs)
+        return stats, mock_s
+
+    def _audit_by_name(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        rows = {r[0]: r for r in wb["Company_Audit"].iter_rows(min_row=2, values_only=True)}
+        wb.close()
+        return rows
+
+    def test_only_flagged_rows_get_suggestions_by_default(self):
+        stats, mock_s = self._run()
+        called_for = {c.args[0] for c in mock_s.call_args_list}
+        self.assertEqual(called_for, {"AggCo"})
+        self.assertEqual(stats["urls_suggested"], 1)
+        rows = self._audit_by_name()
+        self.assertEqual(rows["AggCo"][11], "https://jobs.lever.co/found")
+        self.assertEqual(rows["AggCo"][12], "evidence")
+        self.assertIn(rows["AggCo"][13], (None, ""))       # Approve? left blank
+        self.assertIn(rows["CleanCo"][11], (None, ""))
+
+    def test_non_ats_included_with_opt_in(self):
+        stats, mock_s = self._run(suggest_non_ats=True)
+        called_for = {c.args[0] for c in mock_s.call_args_list}
+        self.assertEqual(called_for, {"AggCo", "SiteCo"})
+
+    def test_suggest_limit_caps_lookups(self):
+        stats, mock_s = self._run(suggest_non_ats=True, suggest_limit=1)
+        self.assertEqual(stats["urls_suggested"], 1)
+
+
+class TestApplyAudit(unittest.TestCase):
+    """--apply-audit writes ONLY Track/Focus, matched by Company Name."""
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel, replace_audit_sheet
+        self.ledger_path = _isolate_ledger(self)
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.append(["TrackCo", "AI-native", "old focus",
+                   "https://jobs.lever.co/trackco", None, 1, 2, 0, "No"])
+        ws.append(["FocusCo", "Fintech", "wrong focus",
+                   "https://user-edited.example.com/careers", None, 0, 0, 0, "No"])
+        ws.append(["UntouchedCo", "Space", "fine",
+                   "https://jobs.lever.co/untouchedco", None, 0, 0, 0, "No"])
+        wb.save(self.path)
+        wb.close()
+        # Audit tab: proposals for TrackCo (track), FocusCo (focus),
+        # DeletedCo (user removed it), BadTrackCo (invalid bucket).
+        def arow(name, pt, pf, su="", ap=""):
+            return [name, "?", pt, "YES" if pt else "no", "cur", pf,
+                    "YES" if pf else "no", "", "track:yes focus:yes", "", "ts",
+                    su, "evidence" if su else "", ap]
+        self._arow = arow
+        replace_audit_sheet(self.path, [
+            arow("TrackCo", "Robotics", ""),
+            arow("FocusCo", "", "FocusCo builds correct things."),
+            arow("DeletedCo", "Space", "gone"),
+            arow("UntouchedCo", "", ""),
+        ])
+        # BadTrackCo row appended directly with an invalid bucket value.
+        wb = openpyxl.load_workbook(self.path)
+        wb["Company_Audit"].append(arow("TrackCo2-Invalid", "NotABucket", ""))
+        wb["Company_List"].append(["TrackCo2-Invalid", "Space", "f",
+                                   "https://x.example.com", None, 0, 0, 0, "No"])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _company_rows(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        rows = {r[0]: r for r in wb["Company_List"].iter_rows(min_row=2, values_only=True) if r[0]}
+        wb.close()
+        return rows
+
+    def test_applies_track_and_focus_by_name_only(self):
+        counts = company_agent_mod.apply_audit(self.path)
+        self.assertEqual(counts["track_applied"], 1)
+        self.assertEqual(counts["focus_applied"], 1)
+        self.assertEqual(counts["skipped_missing"], 1)   # DeletedCo
+        self.assertEqual(counts["skipped_invalid"], 1)   # NotABucket
+        rows = self._company_rows()
+        self.assertEqual(rows["TrackCo"][1], "Robotics")
+        self.assertEqual(rows["TrackCo"][2], "old focus")            # focus kept
+        self.assertEqual(rows["FocusCo"][2], "FocusCo builds correct things.")
+        self.assertEqual(rows["FocusCo"][1], "Fintech")              # track kept
+        self.assertEqual(rows["TrackCo2-Invalid"][1], "Space")       # invalid skipped
+        self.assertEqual(rows["UntouchedCo"][1], "Space")
+
+    def test_never_writes_names_or_career_urls(self):
+        before = {n: (r[0], r[3]) for n, r in self._company_rows().items()}
+        with patch("agents.company_agent.update_company_career_url") as mock_url:
+            company_agent_mod.apply_audit(self.path)
+        mock_url.assert_not_called()
+        after = {n: (r[0], r[3]) for n, r in self._company_rows().items()}
+        self.assertEqual(before, after)
+
+    def test_job_counts_survive_apply_and_sort(self):
+        company_agent_mod.apply_audit(self.path)
+        rows = self._company_rows()
+        self.assertEqual(rows["TrackCo"][5:8], (1, 2, 0))
+
+    def test_no_audit_tab_is_noop(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path)
+        del wb["Company_Audit"]
+        wb.save(self.path)
+        wb.close()
+        counts = company_agent_mod.apply_audit(self.path)
+        self.assertEqual(sum(counts.values()), 0)
+
+    def _set_suggestion(self, name, url, approve):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_Audit"]
+        for r in range(2, ws.max_row + 1):
+            if ws.cell(r, 1).value == name:
+                ws.cell(r, 12, url)
+                ws.cell(r, 13, "evidence")
+                ws.cell(r, 14, approve)
+        wb.save(self.path)
+        wb.close()
+
+    def test_approved_suggested_url_applied(self):
+        self._set_suggestion("UntouchedCo", "https://jobs.lever.co/corrected", "Y")
+        counts = company_agent_mod.apply_audit(self.path)
+        self.assertEqual(counts["url_applied"], 1)
+        self.assertEqual(self._company_rows()["UntouchedCo"][3],
+                         "https://jobs.lever.co/corrected")
+
+    def test_lowercase_yes_accepted(self):
+        self._set_suggestion("UntouchedCo", "https://jobs.lever.co/corrected", "yes")
+        counts = company_agent_mod.apply_audit(self.path)
+        self.assertEqual(counts["url_applied"], 1)
+
+    def test_unapproved_suggestion_never_applied(self):
+        self._set_suggestion("UntouchedCo", "https://jobs.lever.co/corrected", "")
+        counts = company_agent_mod.apply_audit(self.path)
+        self.assertEqual(counts["url_applied"], 0)
+        self.assertEqual(self._company_rows()["UntouchedCo"][3],
+                         "https://jobs.lever.co/untouchedco")
+
+    def test_garbage_approval_value_not_applied(self):
+        self._set_suggestion("UntouchedCo", "https://jobs.lever.co/corrected", "maybe")
+        counts = company_agent_mod.apply_audit(self.path)
+        self.assertEqual(counts["url_applied"], 0)
+
+    def test_urls_only_skips_track_and_focus(self):
+        self._set_suggestion("UntouchedCo", "https://jobs.lever.co/corrected", "Y")
+        counts = company_agent_mod.apply_audit(self.path, urls_only=True)
+        self.assertEqual(counts["url_applied"], 1)
+        self.assertEqual(counts["track_applied"], 0)
+        self.assertEqual(counts["focus_applied"], 0)
+        rows = self._company_rows()
+        self.assertEqual(rows["TrackCo"][1], "AI-native")     # proposal skipped
+        self.assertEqual(rows["FocusCo"][2], "wrong focus")   # proposal skipped
+        self.assertEqual(rows["UntouchedCo"][3], "https://jobs.lever.co/corrected")
+
+    def test_applied_values_recorded_in_ledger(self):
+        company_agent_mod.apply_audit(self.path)
+        ledger = company_agent_mod._load_audit_ledger()
+        self.assertEqual(ledger["track"].get("TrackCo"), "Robotics")
+        self.assertEqual(ledger["focus"].get("FocusCo"),
+                         company_agent_mod._focus_fingerprint(
+                             "FocusCo builds correct things."))
+
+
+class TestAuditAntiOscillation(unittest.TestCase):
+    """A user-confirmed Track/Focus value is not re-proposed by later audits."""
+
+    def setUp(self):
+        import tempfile
+        import openpyxl
+        from shared.excel_store import get_or_create_excel
+        self.ledger_path = _isolate_ledger(self)
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        wb["Company_List"].append(
+            ["FlipCo", "Mid-large Tech", "FlipCo builds things.",
+             "https://jobs.lever.co/flipco", None, 0, 0, 0, "No"])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _run_audit(self):
+        resp = MagicMock()
+        resp.text = json.dumps({"items": [
+            {"company_name": "FlipCo", "track": "AI-native",
+             "track_confident": True, "focus_accurate": False,
+             "proposed_focus": "FlipCo actually builds other things.",
+             "focus_confident": True, "notes": "flip"},
+        ]})
+        pool = MagicMock()
+        pool.generate_content.return_value = resp
+        with patch.object(company_agent_mod, "_KEY_POOL", pool), \
+             patch.dict(os.environ, {"GEMINI_API_KEY": "test-key"}), \
+             patch("agents.company_agent.time.sleep"):
+            return company_agent_mod.run_company_audit(self.path, skip_http=True)
+
+    def _audit_row(self):
+        import openpyxl
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        row = list(wb["Company_Audit"].iter_rows(min_row=2, values_only=True))[0]
+        wb.close()
+        return row
+
+    def test_unconfirmed_value_still_proposed(self):
+        stats = self._run_audit()
+        self.assertEqual(stats["track_changes"], 1)
+        self.assertEqual(stats["suppressed"], 0)
+
+    def test_confirmed_values_suppress_reproposals(self):
+        company_agent_mod._save_audit_ledger({
+            "track": {"FlipCo": "Mid-large Tech"},
+            "focus": {"FlipCo": company_agent_mod._focus_fingerprint(
+                "FlipCo builds things.")},
+        })
+        stats = self._run_audit()
+        self.assertEqual(stats["track_changes"], 0)
+        self.assertEqual(stats["focus_changes"], 0)
+        self.assertEqual(stats["suppressed"], 2)
+        row = self._audit_row()
+        self.assertIn(row[2], (None, ""))
+        self.assertIn(row[5], (None, ""))
+        self.assertIn("suppressed", row[9])
+
+    def test_user_edit_reopens_proposals(self):
+        # Ledger says Mid-large Tech was confirmed, but the user has since
+        # hand-edited the cell to something else → suppression must NOT fire.
+        company_agent_mod._save_audit_ledger({
+            "track": {"FlipCo": "Fintech"}, "focus": {}})
+        stats = self._run_audit()
+        self.assertEqual(stats["track_changes"], 1)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -394,7 +394,17 @@ def _vertical_domain(track: str) -> str | None:
     return None
 
 TPM_KW = ["technical program manager", "tpm", "technical program mgr",
-          "tech program manager"]
+          "tech program manager",
+          # 2026-08-19 widening: many companies title the same role
+          # "Technical Project Manager" — accepted on every track.
+          "technical project manager", "technical project mgr",
+          "tech project manager"]
+
+# 2026-08-19 widening: at these vertical tracks a plain "Program Manager"
+# title is usually a technical program role (small orgs, loose titling), so
+# it passes the title filter. Fintech and Mid-large Tech keep the strict
+# TPM-title rule — their generic-PM population is largely non-technical.
+PM_TITLE_OK_TRACKS = frozenset({"AI-native", "Robotics", "Space", "Defense"})
 
 # ── ATS API fetch (Path A: Greenhouse / Lever) ────────────────────────────────
 def _parse_iso_date(value) -> str:
@@ -595,27 +605,43 @@ def _fetch_workable_jobs(career_url: str) -> list:
 # Filtered by title pre-scrape (_tpm_filter) and at write time (_gate_and_finalize).
 _INTERN_TITLE_RE = re.compile(r"\bintern(ship)?s?\b|\bco-?op\b|\bnew\s+grad(uate)?\b", re.I)
 
-def _tpm_filter(links: list) -> list:
+def _geo_out_of_scope(location: str, track: str = "") -> bool:
+    """REQ-161/162 geo keep-set, shared by _tpm_filter and _gate_and_finalize:
+    WA / CA / TX / US-Remote on every track; FL additionally kept on the
+    Space track only (Space Coast hiring). "Unknown" always keeps
+    (conservative — only confirmed out-of-region rows drop)."""
+    region = classify_region(location)
+    if region == "FL":
+        return (track or "").strip() != "Space"
+    return region == "Other"
+
+def _tpm_filter(links: list, track: str = "") -> list:
+    # 2026-08-19 widening: PM_TITLE_OK_TRACKS additionally accept plain
+    # "Program Manager" titles (substring also covers "Technical Program
+    # Manager"); all other tracks stay on the strict TPM_KW list.
+    title_kws = list(TPM_KW)
+    if (track or "").strip() in PM_TITLE_OK_TRACKS:
+        title_kws.append("program manager")
     filtered = []
     skipped  = 0
     interns  = 0
     for lnk in links:
-        if not any(kw in lnk.get("title","").lower() for kw in TPM_KW):
+        if not any(kw in lnk.get("title","").lower() for kw in title_kws):
             continue
         if _INTERN_TITLE_RE.search(lnk.get("title", "")):
             interns += 1; continue
-        # PRJ-004 REQ-004-12: tightened geo — keep only Seattle / CA / TX /
-        # US-Remote. "Unknown" (blank/placeholder) keeps, conservative as
-        # before; dropped rows are logged for early post-launch spot checks
-        # (R-10 mitigation).
+        # PRJ-004 REQ-004-12: tightened geo — keep-set per _geo_out_of_scope
+        # (WA/CA/TX/US-Remote; +FL on Space track). "Unknown"
+        # (blank/placeholder) keeps, conservative as before; dropped rows are
+        # logged for early post-launch spot checks (R-10 mitigation).
         loc = lnk.get("location", "")
-        if classify_region(loc) == "Other":
+        if _geo_out_of_scope(loc, track):
             logging.info(f"[GeoFilter] Dropped out-of-region job "
                          f"({loc!r}): {lnk.get('title', '?')}")
             skipped += 1; continue
         filtered.append(lnk)
     if skipped:
-        print(f"    [GeoFilter] skipped {skipped} out-of-region jobs (kept: Seattle/CA/TX/US-Remote).")
+        print(f"    [GeoFilter] skipped {skipped} out-of-region jobs (kept: WA/CA/TX/US-Remote, +FL for Space).")
     if interns:
         print(f"    [InternFilter] skipped {interns} intern/co-op/new-grad roles.")
     return filtered
@@ -702,8 +728,11 @@ def _fetch_workday_jobs(career_url: str) -> list:
     _PAGE_SIZE, _MAX_PAGES = 20, 250
     results, offset = [], 0
     for page in range(_MAX_PAGES):
+        # 2026-08-19 widening: search "Program Manager" (superset — also
+        # surfaces Technical Project Manager and plain PM titles); precision
+        # is restored client-side by _tpm_filter's track-aware keyword list.
         payload = {"limit": _PAGE_SIZE, "offset": offset,
-                   "searchText": "Technical Program Manager"}
+                   "searchText": "Program Manager"}
         logging.info(f"[Workday API] POST {api_url} offset={offset}")
         r = _http_request_with_retry(
             "POST", api_url, timeout=12, json=payload,
@@ -812,7 +841,9 @@ def _firecrawl_map(career_url: str) -> list:
         try:
             logging.info(f"[Firecrawl] map attempt {attempt + 1}/3: {career_url}")
             # PRJ-004 REQ-004-13: no artificial cap on mapped URLs.
-            res = _FC_POOL.map(url=career_url, search="Technical Program Manager")
+            # 2026-08-19 widening: "Program Manager" superset query; the
+            # LLM filter / _merge_filter downstream keep precision.
+            res = _FC_POOL.map(url=career_url, search="Program Manager")
             if res is None:  # pool exhausted mid-call
                 return []
             urls = getattr(res, "links", None) or (res.get("links",[]) if isinstance(res,dict) else res if isinstance(res,list) else [])
@@ -857,6 +888,11 @@ def _fetch_amazon_jobs(career_url: str) -> list:
     results, offset = [], 0
     _PAGE, _MAX_PAGES = 100, 50  # runaway guard: 5,000 postings
     for _page in range(_MAX_PAGES):
+        # 2026-08-19 title widening: query deliberately NOT broadened to
+        # "program manager" — Amazon is Mid-large Tech (generic PM titles
+        # stay out of scope) and a broader query would push real TPM rows
+        # past the 5,000-posting runaway guard. base_query is fuzzy, so
+        # "Technical Project Manager" titles still surface.
         api_url = ("https://www.amazon.jobs/en/search.json"
                    "?base_query=technical+program+manager&country=USA"
                    f"&result_limit={_PAGE}&offset={offset}")
@@ -926,6 +962,10 @@ def _fetch_google_jobs(career_url: str) -> list:
     Note: Google clamps page=N to the last page (repeats its results), so
     pagination stops when a page yields no NEW job ids, not on an empty page.
     """
+    # 2026-08-19 title widening: exact-phrase query deliberately kept —
+    # Google is Mid-large Tech (generic PM out of scope) and titles TPM
+    # roles "Technical Program Manager" consistently; unquoting would
+    # multiply result pages for no recall gain.
     _BASE = ("https://www.google.com/about/careers/applications/jobs/results"
              "?q=%22technical+program+manager%22&location=United+States")
     _HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -1030,7 +1070,8 @@ def _resolve_list_fn(fn_name: str):
     }[fn_name]
 
 
-async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler) -> list | None:
+async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler,
+                            track: str = "") -> list | None:
     """Attempt API-based job discovery for a matched ATS platform.
 
     Returns a candidate list on success, or None to signal fallback needed.
@@ -1046,7 +1087,7 @@ async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler) 
         print(f"    → Path A: ATS API ({platform.title()})...")
         jobs = list_fn(career_url)
         if jobs:
-            cands = _tpm_filter(jobs)
+            cands = _tpm_filter(jobs, track)
             print(f"    → {len(jobs)} total, {len(cands)} TPM candidates")
             return cands
         print("    → API failed, falling back to crawler")
@@ -1057,7 +1098,7 @@ async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler) 
         print("    → Path W: Workday JSON API...")
         jobs = list_fn(career_url)
         if jobs:
-            cands = _tpm_filter(jobs)
+            cands = _tpm_filter(jobs, track)
             print(f"    → {len(jobs)} total, {len(cands)} TPM candidates")
             if cands:
                 return cands
@@ -1065,7 +1106,7 @@ async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler) 
         else:
             print("    → Workday API failed, falling back to crawler")
         links = await _crawl_page(career_url, crawler)
-        cands = _tpm_filter(links)
+        cands = _tpm_filter(links, track)
         print(f"    → Crawled {len(links)} links, {len(cands)} TPM candidates")
         return cands
 
@@ -1073,12 +1114,12 @@ async def _discover_via_api(career_url: str, platform: str, cfg: dict, crawler) 
 
 
 # ── Job discovery router ──────────────────────────────────────────────────────
-async def discover_jobs(career_url: str, crawler) -> list:
+async def discover_jobs(career_url: str, crawler, track: str = "") -> list:
     # 1. Direct URL match against routing table
     match = _match_ats(career_url)
     if match:
         platform, cfg = match
-        result = await _discover_via_api(career_url, platform, cfg, crawler)
+        result = await _discover_via_api(career_url, platform, cfg, crawler, track)
         if result is not None:
             return result
         # json_api fallback: API returned empty, fall through to crawler path below
@@ -1105,11 +1146,11 @@ async def discover_jobs(career_url: str, crawler) -> list:
             if board_fn_name and board_cfg.get("strategy") == "json_api":
                 jobs = _resolve_list_fn(board_fn_name)(board_url)
                 if jobs:
-                    cands = _tpm_filter(jobs)
+                    cands = _tpm_filter(jobs, track)
                     print(f"    → {len(jobs)} total, {len(cands)} TPM candidates")
                     return cands
         links = await _crawl_ats_board(board_url, platform, crawler)
-        cands = _tpm_filter(links)
+        cands = _tpm_filter(links, track)
         print(f"    → Crawled {len(links)} links, {len(cands)} TPM candidates")
         return cands
 
@@ -1123,18 +1164,32 @@ def llm_filter_jobs(company: str, links: list, track: str = "") -> list:
     if _KEY_POOL is None:
         raise RuntimeError("_KEY_POOL not initialized — call main() first or set _KEY_POOL before invoking llm_filter_jobs()")
     forced_domain = _vertical_domain(track) if track else None
-    if forced_domain:
-        # PRJ-004 REQ-004-09: at a vertical-track company every genuine TPM
-        # role qualifies — filter only for role type and link validity.
+    if forced_domain and (track or "").strip() in PM_TITLE_OK_TRACKS:
+        # PRJ-004 REQ-004-09 + 2026-08-19 widening: at AI/Robotics/Space/
+        # Defense companies plain "Program Manager" titles also qualify —
+        # filter only for role type and link validity.
         rule = (f"Company: {company} is a {forced_domain}-track company; every "
                 "genuine Technical Program Manager / TPM role qualifies. "
-                "Return ONLY URLs for TPM roles. "
-                "Reject Product Manager, Engineering Manager, Project Manager, "
-                "and similar non-TPM titles. Reject ghost/closed/404 links.")
+                "Return ONLY URLs for Technical Program Manager, Program "
+                "Manager, and Technical Project Manager roles. "
+                "Reject Product Manager, Engineering Manager, and clearly "
+                "non-technical Project Manager titles (e.g. Finance/HR/"
+                "Marketing project managers). Reject ghost/closed/404 links.")
+    elif forced_domain:
+        # Fintech vertical: every genuine TPM role qualifies, but generic
+        # "Program Manager" stays out (large non-technical PM population).
+        rule = (f"Company: {company} is a {forced_domain}-track company; every "
+                "genuine Technical Program Manager / TPM role qualifies. "
+                "Return ONLY URLs for Technical Program Manager / TPM and "
+                "Technical Project Manager roles. "
+                "Reject Product Manager, Engineering Manager, generic Program "
+                "Manager, and non-technical Project Manager titles. "
+                "Reject ghost/closed/404 links.")
     else:
         rule = (
             "You are a strict Technical Recruiter at a mid-large tech company. "
-            "Return ONLY URLs for Technical Program Manager / TPM roles that "
+            "Return ONLY URLs for Technical Program Manager / TPM and "
+            "Technical Project Manager roles that "
             "belong to one of five tracks:\n"
             "  - AI: AI/ML models, AI products/platforms, AI/ML infrastructure, "
             "cloud/compute infrastructure (datacenter, silicon, GPU fleet)\n"
@@ -1147,8 +1202,9 @@ def llm_filter_jobs(company: str, links: list, track: str = "") -> list:
             "  - Defense: defense/gov sub-orgs (Azure Government, AWS GovCloud/DoD, "
             "mission-systems teams)\n"
             "Reject TPM roles in Finance, HR, Legal, Marketing, or generic non-track "
-            "engineering. Reject Product Manager, Engineering Manager, Project "
-            "Manager, and similar titles. Reject ghost/closed/404 links.")
+            "engineering. Reject Product Manager, Engineering Manager, generic "
+            "Program Manager, and non-technical Project Manager titles. "
+            "Reject ghost/closed/404 links.")
     cfg = types.GenerateContentConfig(
         system_instruction=rule + SECURITY_CLAUSE,
         temperature=0.0,
@@ -1979,11 +2035,12 @@ def _gate_and_finalize(parsed: dict, track: str, url: str,
     retry alike (BUG-66: the geo/domain/YoE/work-auth gates previously only
     covered the generic-crawler path)."""
     # ── Gate 0 (REQ-004-12, BUG-66): geo — unconditional on all paths.
-    # Blank/unrecognized locations classify as "Unknown" and are kept for
-    # review (they surface via Data Quality="partial"); only rows whose
-    # location confirmably matches no target region are dropped.
+    # Keep-set per _geo_out_of_scope (WA/CA/TX/US-Remote; +FL on Space
+    # track, REQ-162). Blank/unrecognized locations classify as "Unknown"
+    # and are kept for review (they surface via Data Quality="partial");
+    # only rows whose location confirmably matches no target region drop.
     loc = parsed.get("location", "")
-    if classify_region(loc) == "Other":
+    if _geo_out_of_scope(loc, track):
         print(f"      🌍 [GeoFilter] Skipped out-of-region ({loc}): {url}")
         return None
     # ── Gate 1 (REQ-004-09): domain. Vertical companies can't hit "None"
@@ -2107,7 +2164,7 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
         print("    ⏳ Path B rate-limit delay (15s)...")
         await asyncio.sleep(15)
 
-    raw = await discover_jobs(career_url, crawler)
+    raw = await discover_jobs(career_url, crawler, track)
     if not raw:
         print("    No TPM jobs found.")
         return
@@ -2462,11 +2519,11 @@ async def _main_inner(summary: RunSummary):
                              f"{AUTO_ARCHIVE_THRESHOLD}).")
 
     # ── Phase: Sort JD_Tracker by location tier ───────────────────────────────
-    # Greater Seattle (green) → Remote (yellow) → Other, Updated At desc within tier.
+    # Combined 1–6 sort tier: freshness primary, WA/Remote > CA/TX secondary.
     # Wrapped in try/except so a sort failure (e.g. file open in Excel) does not
     # discard the run's actual JD writes.
     print(f"\n{'='*60}")
-    print("🗺️  Sorting JD_Tracker by location tier (Greater Seattle → Remote → Other)...")
+    print("🗺️  Sorting JD_Tracker by sort tier (freshness × WA/Remote > CA/TX)...")
     try:
         n_sorted = sort_jd_tracker_by_tier(xlsx_path)
         print(f"   Sorted {n_sorted} JD rows + applied tier highlights.")

@@ -56,17 +56,32 @@ PathFinder is a multi-agent AI system for TPM job seekers, consisting of four in
      a. Re-read existing companies (Company_List + Company_Without_TPM) → exclusion list
      b. compute_need_by_track → allocate_batch (≤ BATCH_SIZE across open buckets)
      c. Tavily batch search (14 track-biased queries)
-     d. Gemini LLM extracts company info (name, track, business focus), does not generate URLs
-     e. Deterministic bucket rules (defense-prime exclusion, quota trim)
+     d. Gemini LLM extracts company info (name, track, business focus,
+        confident flag — BUG-76), does not generate URLs
+     e. Deterministic bucket rules (defense-prime exclusion, quota trim);
+        unconfident extractions then get Track/Business Focus blanked so the
+        confident-gated repair steps (3/4 below) refill them (BUG-76)
      f. Per-company multi-strategy Career URL finding:
           ① KNOWN_CAREER_URLS hardcoded → ② Tavily ATS-targeted search
           → ③ Tavily general search → ④ Greenhouse/Lever/Ashby/Workable slug probing
           → ⑤ Homepage crawling
         Companies without a found URL are skipped (not written)
+        URL-quality gates (BUG-74/75/77) applied on every strategy:
+          - job-posting URLs rejected / stripped to their board root
+            (_is_job_posting_url / _posting_url_to_board_root)
+          - aggregator hosts rejected (_AGGREGATOR_HOSTS suffix blocklist;
+            jobs.gem.com deliberately allowed — real ATS)
+          - slug-probe hits must pass the board-OWNERSHIP check
+            (_ats_board_belongs_to_company: org name via ATS API/board title,
+            equality-only matching generalized from the Workday matcher)
+          - homepage guesses must identify as the company
+            (_homepage_belongs_to_company: <title>/og:site_name)
      g. Upsert batch to Company_List
-2. Phase 1.5: Probe and upgrade non-ATS URLs → write back. Also detects
-     manually-inserted rows (Company Name present, Career URL blank) and
-     runs the full find_career_url pipeline to backfill the URL.
+2. Phase 1.5: Backfill blank Career URLs on manually-inserted rows (Company
+     Name present, Career URL blank) via the full find_career_url pipeline.
+     FILLED Career URLs are user-verified data and are NEVER rewritten
+     (BUG-74/75 write guard; pre-fix this step probe-and-overwrote every
+     filled non-ATS URL). URL findings for filled rows: report-only --audit.
 3. Business Focus re-enrich (BUG-69): fill blank/N-A Business Focus cells.
 4. Track enrich (run_enrich_missing_tracks): fill blank Track cells via the
      shared batched Gemini classifier; unconfident rows stay blank for retry;
@@ -81,6 +96,28 @@ PathFinder is a multi-agent AI system for TPM job seekers, consisting of four in
 - `BATCH_SIZE = 50` (new companies per discovery-loop iteration)
 - `TRACK_ORDER` (`shared/config.py`): canonical 6-bucket order shared by
   company_agent and the excel_store sorter
+
+**Staged audit mode (`--audit`, BUG-74~77)**: report-only review of every
+Company_List row — batched Gemini re-evaluation of Track/Business Focus
+(temperature 0, do-not-guess confidence gates, valid-names filter; zero
+Tavily) plus URL health flags (`POSTING_URL(→root)` / `AGGREGATOR` /
+`OWNERSHIP_MISMATCH` / `HTTP_FAIL` / informational `NON_ATS`). Results land
+in the transient **`Company_Audit`** tab (`replace_audit_sheet`:
+create-or-replace, never auto-created by `get_or_create_excel`); Company_List
+is never written. Flags: `--audit-limit N` (dry run), `--audit-skip-http`.
+**`--suggest-urls`** (with `--audit`) additionally looks up a replacement
+URL for rows with actionable flags (NON_ATS rows only via
+`--suggest-non-ats`; `--suggest-limit N` caps Tavily spend), cheapest-first:
+posting-root strip → known table → ownership-gated ATS slug probe → Tavily →
+identity-gated homepage. Suggestions land in Suggested URL / URL Evidence /
+Approve URL? columns.
+
+After user review, **`--apply-audit`** applies the tab's proposed Track/
+Business Focus values and — only where the user set "Approve URL?" to Y —
+the suggested Career URL (the sole sanctioned URL write outside blank-row
+backfill). Matched by Company Name (never excel_row: sorts and user
+deletions shift rows); Names never written; invalid buckets and
+since-deleted companies skipped; canonical Track sort last.
 
 ---
 
@@ -438,6 +475,7 @@ pathfinder/
 | v1.5 | 2026-03-17 | Added Observability Agent (run reporting, quality drift detection, anomaly alerting) and Cost Agent (token usage estimation, quota monitoring, cost optimization recommendations). Custom Agents grew from 9 to 11. | Runtime quality monitoring and cost governance capabilities specific to AI projects, filling gaps in traditional SDLC for AI dimensions |
 | v1.6 | 2026-04-28 | **PRJ-002: 3-Dimension Scoring**. Restructured the resume-fit scoring pipeline from a single LLM-derived "fit score" into three parallel dimensions: ATS Coverage (deterministic, `shared/ats_matcher.py`), Recruiter Score (Gemini, was COARSE), HM Score (Gemini, was FINE). New `JobDetails.ats_keywords` field; `Match_Results` +4 cols; `Tailored_Match_Results` +9 cols (auto-migrated). Optimizer rescores all 3 dims; regression flag now means HM Delta < 0 only (was: legacy single-score delta). Tests 619 → 718 (+99 across 5 sequential PRs). Plus P0 follow-ups: P0-9 Stage 2 UNION selection, P0-10 single-JD rescore parity, P0-11 Gemini transient backoff retry, P0-12 persisted Regression column. | Existing single-score Score Delta conflated keyword gains with semantic strength; users had no signal on which one moved. Mapping each dimension to one real-world hiring filter (ATS keyword search → recruiter scan → HM deep eval) makes the system's output match the actual North American funnel. |
 | v1.7 | 2026-05-20 | **PRJ-003 + operational hardening**. (a) PDF resume I/O: `shared/resume_io.py` centralizes `load_resume` across match + optimizer; supports `.md/.txt/.pdf` input via `pdfplumber` (deterministic, layout-aware, cached at `profile/.cache/`); every tailored `.md` also rendered as a sibling `.pdf` via WeasyPrint with ATS-safe CSS (`templates/resume.css`). (b) Discovery coverage: Workable as first-class ATS, LinkedIn/VC-portfolio URL unwrapper, Workday-via-Tavily fallback with strict subdomain-equality guard (26 cos recovered). (c) Manual-entry override: `run_phase_1_5` backfills Career URL on hand-inserted `Company_List` rows. (d) Tailored-resume user-edit protection via sha256 stored in `Tailored_Match_Results.Last Written Hash`. (e) `JD_Tracker` auto-sort by Location Tier (Greater Seattle / Remote / Other) with new `Location Tier` column. (f) launchd-based daily pipeline runner under `scripts/`. (g) Gemini model name → GA (`gemini-3.1-flash-lite`, drop `-preview`). Tests: 749 → 859 (+110). | PRJ-003 closes the resume-format gap (real submissions are PDFs, not Markdown). Manual-entry + URL unwrapper unblocks the user dropping in a target list without per-company ATS hunting. User-edit protection prevents the daily launchd runner from silently clobbering hand-polished resumes. Location-tier sort matches the user's actual review workflow. |
-| v2.1 (current) | 2026-07-16 | **Concurrent-run safety (BUG-73)**. New `shared/run_lock.py`: every agent `__main__` holds an exclusive `flock` on `logs/pathfinder.lock` for its whole run — a second agent fails fast naming the holder (agent/pid/start), or queues when `PATHFINDER_LOCK_WAIT=1` (exported by `run_pipeline_scheduled.sh`); lock release is kernel-guaranteed on any exit. Persistence: all `read_only` workbook loads routed through `load_workbook_readonly` (BytesIO snapshot + 3-attempt retry on half-written zip); `get_company_archive_info` rewritten to a single `iter_rows` pass (read-only per-cell access re-parses sheet XML per call, O(rows²) — remaining 16 read helpers still on that pattern, snapshot-protected, follow-up). | 2026-07-16: a manual job_agent run overlapped the still-running (6h) scheduled pipeline — EOFError crash mid-read when the pipeline saved the workbook, duplicate scraping spend on 387 JDs, and a silent last-writer-wins race. Nothing enforced the persistence layer's single-process assumption across processes. |
+| v2.2 (current) | 2026-08-19 | **Filter widening: titles + WA geo**. Title filter: `TPM_KW` gains "Technical Project Manager" (+ variants) on all tracks; new `PM_TITLE_OK_TRACKS` (AI-native/Robotics/Space/Defense) additionally accepts plain "Program Manager" in `_tpm_filter` (track threaded `process_company → discover_jobs → _discover_via_api`) and in the `llm_filter_jobs` rules (three-way split: PM-OK vertical / Fintech / mid-large). Server-side queries: Workday `searchText` + Firecrawl map broadened to "Program Manager"; Amazon/Google deliberately kept narrow (pagination caps). Geo: `classify_region` region "Seattle" → "WA" — any `", WA"` state token (word-boundary regex) or explicit Washington-state form; keep-set now WA/CA/TX/US-Remote, sort-tier grouping WA+Remote > CA/TX. Company discovery aligned to the same scope (GEOGRAPHY prompt clause: WA state + US-remote qualification; `TAVILY_QUERIES` = per-track bases + one uniform `_QUERY_GEO_TAIL`, no per-track geo — both soft biases, no deterministic company-level filter; +`_SPACE_REGION_QUERIES` geo-targeted Space exception). FL = Space-track-only region (REQ-162): `classify_region` gains "FL", track-aware keep via shared `_geo_out_of_scope(location, track)` in both geo gates, GEOGRAPHY clause Space-FL exception, sort tier FL grouped with CA/TX. Tests 945+ → 1,149. | Title conventions vary ("Technical Project Manager" = same role at many companies; vertical-track orgs title technical roles plain "Program Manager" — small orgs, no non-tech PM bureaucracy), and the user's real commutable scope is all of WA (Bellevue/Redmond/Everett/Kent — Boeing, Blue Origin sites), not just the Seattle-metro city list. Recall widened at the cheap pre-scrape stage; write-time gates (domain/YoE/work-auth) keep final precision. |
+| v2.1 | 2026-07-16 | **Concurrent-run safety (BUG-73)**. New `shared/run_lock.py`: every agent `__main__` holds an exclusive `flock` on `logs/pathfinder.lock` for its whole run — a second agent fails fast naming the holder (agent/pid/start), or queues when `PATHFINDER_LOCK_WAIT=1` (exported by `run_pipeline_scheduled.sh`); lock release is kernel-guaranteed on any exit. Persistence: all `read_only` workbook loads routed through `load_workbook_readonly` (BytesIO snapshot + 3-attempt retry on half-written zip); `get_company_archive_info` rewritten to a single `iter_rows` pass (read-only per-cell access re-parses sheet XML per call, O(rows²) — remaining 16 read helpers still on that pattern, snapshot-protected, follow-up). | 2026-07-16: a manual job_agent run overlapped the still-running (6h) scheduled pipeline — EOFError crash mid-read when the pipeline saved the workbook, duplicate scraping spend on 387 JDs, and a silent last-writer-wins race. Nothing enforced the persistence layer's single-process assumption across processes. |
 | v2.0 | 2026-07-09 | **Excel-review follow-up batch** (BUG-62, BUG-65~69 + T16). Persistence: `TRIAGE_SHEETS` user triage tabs (`JD_ToApply`/`Skipped JD`) with permanent URL exclusion via `get_triaged_jd_urls`; `get_incomplete_company_rows`/`update_company_business_focus`. job_agent: write-time gates factored into `_gate_and_finalize` and applied on every staging path (custom scrapers + retry — closes the India/Europe geo leak); extraction prompt captures ALL locations verbatim; shared `_parse_jsonld_jobposting` consolidates 4 JSON-LD blocks and adds `datePosted` recovery (list-meta → scrape stash → plain-GET → Tavily → keep+flag); retry preserves Posted Date; Google Careers discovery adapter `_fetch_google_jobs` (server-rendered `AF_initDataCallback` payload — design.md's v3 API is dead; prefetched JD text, zero Firecrawl); empty-company extractions write JSON-ERROR audit rows (BUG-62). New `shared/firecrawl_pool.py` replaces per-call-site `FirecrawlApp` construction (`fc_key` threading removed). company_agent: `run_reenrich_business_focus` self-heal step after Phase 1.5. Dead `_is_us*`/pycountry code removed — `classify_region` is the sole live geo filter. | User's post-launch manual review: triage work must be final (not undone by the next run); India/Europe rows and blank posted dates were data-quality bugs; Firecrawl credits ran out invisibly; Google (a target company) was undiscoverable. |
 | v1.9 | 2026-07-07 | **PRJ-004: Multi-Track Expansion**. Company universe: 6 AI buckets/200 cap → 6-track taxonomy at 500 (AI-native/Mid-large Tech/Robotics/Fintech/Space/Defense, per-bucket quotas + grandfathering, `--migrate-tracks` one-time re-bucketing). Job filtering: AI-purity layer → 5-track domain classifier with big-tech sub-org anchors; new write-time gates (YoE [stated min ≤3/≥12 skip], global work-auth screen, ≤14-day pre-scrape freshness on parseable dates); geo tightened to Seattle/CA/TX/US-Remote. JD_Tracker: Job Domain + 6 new columns, combined 1–6 Sort Tier recomputed at each sort. Scrapers: Workday pagination (uncapped), Firecrawl map uncapped, Amazon.jobs adapter with prefetched JD text (zero crawler fallback), list_meta generalizes workday_meta. Match layer: 5 per-track Recruiter/HM prompt pairs + tailor emphasis, routing by Job Domain in both match_agent and resume_optimizer, per-track context caches, REQ-052 byte identity preserved per track. Ops: launchd failure markers, RunSummary token-usage notes. Tests 859 → 945. | User's updated thesis: six tracks with 10-year runway; winning play is early companies + early divisions of incumbents. Freshness is first-class (≤15-day postings only); seniority judged by JD content (YoE) not title; ITAR/clearance screen for a green-card holder. |

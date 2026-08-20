@@ -307,7 +307,9 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
             "business_focus": "X", "career_url": "https://acme.io/careers"
         }])
         row = self._read_row("Acme")
-        self.assertEqual(row[3], "https://acme.io/careers", "career_url should update")
+        # REQ-153: a filled Career URL is user-verified and never overwritten
+        self.assertEqual(row[3], "https://example.com/jobs",
+                         "filled career_url must be preserved (REQ-153)")
         self.assertEqual(row[5], 5, "TPM Jobs must be preserved")
         self.assertEqual(row[6], 2, "AI TPM Jobs must be preserved")
         self.assertEqual(row[7], 1, "No TPM Count must be preserved")
@@ -335,7 +337,8 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
         row = self._read_row("MutCo")
         self.assertEqual(row[1], "Robotics")
         self.assertEqual(row[2], "Updated focus")
-        self.assertEqual(row[3], "https://mutco.io/jobs")
+        # REQ-153: col 4 is the exception — filled Career URL never overwritten
+        self.assertEqual(row[3], "https://example.com/jobs")
         # Updated At (col 5, index 4) should be a non-empty string
         self.assertIsNotNone(row[4])
         self.assertNotEqual(row[4], "")
@@ -2866,9 +2869,23 @@ class TestClassifyRegion(unittest.TestCase):
         from shared.excel_store import classify_region
         return classify_region(loc)
 
-    def test_seattle(self):
-        self.assertEqual(self._r("Seattle, WA"), "Seattle")
-        self.assertEqual(self._r("Bellevue, WA"), "Seattle")
+    def test_wa_state(self):
+        self.assertEqual(self._r("Seattle, WA"), "WA")
+        self.assertEqual(self._r("Bellevue, WA"), "WA")
+        # 2026-08-19 widening: whole WA state, not just Seattle metro
+        self.assertEqual(self._r("Spokane, WA"), "WA")
+        self.assertEqual(self._r("Vancouver, WA"), "WA")
+        self.assertEqual(self._r("Richland, WA, USA"), "WA")
+        self.assertEqual(self._r("Washington State"), "WA")
+        self.assertEqual(self._r("Washington, USA"), "WA")
+
+    def test_wa_no_false_positives(self):
+        # Bare "Washington" stays ambiguous (D.C. collision) → Other
+        self.assertEqual(self._r("Washington"), "Other")
+        self.assertEqual(self._r("Washington, DC"), "Other")
+        self.assertEqual(self._r("Washington, D.C."), "Other")
+        # ", wa" substring must be a state token, not part of a word
+        self.assertEqual(self._r("Cardiff, Wales"), "Other")
 
     def test_remote(self):
         self.assertEqual(self._r("Remote"), "Remote")
@@ -2884,6 +2901,15 @@ class TestClassifyRegion(unittest.TestCase):
         self.assertEqual(self._r("Austin, TX"), "TX")
         self.assertEqual(self._r("Houston, Texas"), "TX")
 
+    def test_florida(self):
+        # REQ-162: FL recognized unconditionally; Space-only keep is enforced
+        # by job_agent._geo_out_of_scope, not here.
+        self.assertEqual(self._r("Cape Canaveral, FL"), "FL")
+        self.assertEqual(self._r("Melbourne, FL"), "FL")
+        self.assertEqual(self._r("Titusville, Florida"), "FL")
+        # bare "melbourne" (no FL qualifier) is ambiguous (Australia) → Other
+        self.assertEqual(self._r("Melbourne"), "Other")
+
     def test_other_us_dropped_regions(self):
         self.assertEqual(self._r("New York, NY"), "Other")
         self.assertEqual(self._r("Boston, MA"), "Other")
@@ -2894,7 +2920,7 @@ class TestClassifyRegion(unittest.TestCase):
         self.assertEqual(self._r("N/A"), "Unknown")
 
     def test_multi_segment_best_region_wins(self):
-        self.assertEqual(self._r("San Francisco, CA; Seattle, WA"), "Seattle")
+        self.assertEqual(self._r("San Francisco, CA; Seattle, WA"), "WA")
         self.assertEqual(self._r("Austin, TX; Remote"), "Remote")
         self.assertEqual(self._r("New York, NY; Austin, TX"), "TX")
 
@@ -2907,17 +2933,19 @@ class TestComputeSortTier(unittest.TestCase):
         return compute_sort_tier(fresh, region)
 
     def test_matrix(self):
-        self.assertEqual(self._t(1, "Seattle"), 1)
+        self.assertEqual(self._t(1, "WA"), 1)
         self.assertEqual(self._t(1, "Remote"), 1)
         self.assertEqual(self._t(1, "CA"), 2)
         self.assertEqual(self._t(1, "TX"), 2)
-        self.assertEqual(self._t(2, "Seattle"), 3)
+        self.assertEqual(self._t(2, "WA"), 3)
         self.assertEqual(self._t(2, "CA"), 4)
         self.assertEqual(self._t(3, "Remote"), 5)
         self.assertEqual(self._t(3, "TX"), 6)
+        self.assertEqual(self._t(1, "FL"), 2)   # REQ-162: FL groups with CA/TX
+        self.assertEqual(self._t(3, "FL"), 6)
 
     def test_tier_nine_cases(self):
-        self.assertEqual(self._t(None, "Seattle"), 9)   # unknown/aged date
+        self.assertEqual(self._t(None, "WA"), 9)        # unknown/aged date
         self.assertEqual(self._t(1, "Other"), 9)        # non-target region
         self.assertEqual(self._t(1, "Unknown"), 9)
         self.assertEqual(self._t(None, "Other"), 9)
@@ -3301,6 +3329,116 @@ class TestLoadWorkbookReadonlySnapshot(unittest.TestCase):
             wb = load_workbook_readonly(self.path)
         self.assertIn("Company_List", wb.sheetnames)
         wb.close()
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# BUG-74~77 — Company_Audit transient review tab
+# ═════════════════════════════════════════════════════════════════════════════
+class TestReplaceAuditSheet(unittest.TestCase):
+
+    def setUp(self):
+        from shared.excel_store import get_or_create_excel
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        wb["Company_List"].append(
+            ["SomeCo", "AI-native", "focus", "https://jobs.lever.co/someco",
+             None, 0, 0, 0, "No"])
+        wb.save(self.path)
+        wb.close()
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _row(self, name="SomeCo"):
+        return [name, "AI-native", "", "no", "focus", "", "no", "", "track:yes focus:yes",
+                "", "2026-08-19 00:00:00"]
+
+    def test_creates_sheet_with_headers(self):
+        from shared.excel_store import replace_audit_sheet, AUDIT_SHEET, AUDIT_HEADERS
+        n = replace_audit_sheet(self.path, [self._row()])
+        self.assertEqual(n, 1)
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        self.assertIn(AUDIT_SHEET, wb.sheetnames)
+        rows = list(wb[AUDIT_SHEET].iter_rows(values_only=True))
+        wb.close()
+        self.assertEqual(list(rows[0]), AUDIT_HEADERS)
+        self.assertEqual(rows[1][0], "SomeCo")
+
+    def test_replace_is_idempotent_not_append(self):
+        from shared.excel_store import replace_audit_sheet, AUDIT_SHEET
+        replace_audit_sheet(self.path, [self._row("A"), self._row("B")])
+        replace_audit_sheet(self.path, [self._row("C")])
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        rows = list(wb[AUDIT_SHEET].iter_rows(values_only=True))
+        wb.close()
+        self.assertEqual(len(rows), 2)  # header + 1
+        self.assertEqual(rows[1][0], "C")
+
+    def test_other_tabs_untouched(self):
+        from shared.excel_store import replace_audit_sheet, get_company_rows
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        sheets_before = set(wb.sheetnames)
+        wb.close()
+        company_before = get_company_rows(self.path)
+        replace_audit_sheet(self.path, [self._row()])
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        sheets_after = set(wb.sheetnames)
+        wb.close()
+        self.assertEqual(sheets_after - sheets_before, {"Company_Audit"})
+        self.assertEqual(get_company_rows(self.path), company_before)
+
+    def test_not_auto_created_by_get_or_create(self):
+        # Transient tab: get_or_create_excel must NOT create it.
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        self.assertNotIn("Company_Audit", wb.sheetnames)
+        wb.close()
+
+
+class TestUpsertNeverOverwritesFilledCareerUrl(unittest.TestCase):
+    """REQ-153 storage-layer invariant: a filled Career URL is user-verified
+    data — upsert_companies may fill a blank cell but never replace one."""
+
+    def setUp(self):
+        from shared.excel_store import get_or_create_excel
+        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
+        os.close(fd)
+        os.remove(self.path)
+        get_or_create_excel(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.remove(self.path)
+
+    def _url(self, name):
+        wb = openpyxl.load_workbook(self.path, read_only=True)
+        urls = {r[0]: r[3] for r in wb["Company_List"].iter_rows(min_row=2, values_only=True) if r[0]}
+        wb.close()
+        return urls.get(name)
+
+    def test_filled_url_survives_re_upsert(self):
+        from shared.excel_store import upsert_companies
+        upsert_companies(self.path, [{"company_name": "VerifiedCo", "track": "AI-native",
+                                      "business_focus": "f", "career_url": "https://user-verified.example.com"}])
+        upsert_companies(self.path, [{"company_name": "VerifiedCo", "track": "Robotics",
+                                      "business_focus": "new", "career_url": "https://discovered-wrong.example.com"}])
+        self.assertEqual(self._url("VerifiedCo"), "https://user-verified.example.com")
+
+    def test_blank_and_na_urls_still_fillable(self):
+        from shared.excel_store import upsert_companies
+        upsert_companies(self.path, [{"company_name": "BlankCo", "track": "Space",
+                                      "business_focus": "f", "career_url": ""},
+                                     {"company_name": "NaCo", "track": "Space",
+                                      "business_focus": "f", "career_url": "N/A"}])
+        upsert_companies(self.path, [{"company_name": "BlankCo", "track": "Space",
+                                      "business_focus": "f", "career_url": "https://found.example.com"},
+                                     {"company_name": "NaCo", "track": "Space",
+                                      "business_focus": "f", "career_url": "https://found2.example.com"}])
+        self.assertEqual(self._url("BlankCo"), "https://found.example.com")
+        self.assertEqual(self._url("NaCo"), "https://found2.example.com")
 
 
 if __name__ == "__main__":
