@@ -431,9 +431,13 @@ class TestMicrosoftJdScraper(unittest.TestCase):
     def test_scrape_microsoft_jd_uses_firecrawl_with_only_main_content(self):
         # Pool scrape must be called with only_main_content=True so the
         # sidebar/nav is stripped (the audit's actual root cause).
+        # 2026-08-22: JSON-LD (plain GET) is tried first; a page without it
+        # still falls to Firecrawl with only_main_content=True.
         from agents.job_agent import _scrape_microsoft_jd
         pool = _FakeFcPool(scrape_return=MagicMock(markdown="x" * 500))
-        with patch("agents.job_agent._FC_POOL", pool):
+        with patch("agents.job_agent._FC_POOL", pool), \
+             patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, text="<html>no json-ld</html>")
             result = _scrape_microsoft_jd("https://jobs.careers.microsoft.com/global/en/job/1")
         self.assertTrue(len(result) > 200)
         scrape_kwargs = pool.scrape.call_args.kwargs
@@ -947,6 +951,65 @@ class TestFetchAshbyApiParsing(unittest.TestCase):
             )
             result = _fetch_ashby_jobs("https://jobs.ashbyhq.com/testco")
         self.assertEqual(result, [])
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchAshbyPrefetchedJd(unittest.IsolatedAsyncioTestCase):
+    """REQ-172 (2026-08-22): the Ashby job-board API already returns the JD
+    body (descriptionPlain/descriptionHtml) — carry it as _prefetched_md so
+    Ashby JDs skip the browser render entirely (like Amazon/Google)."""
+
+    LONG = "Own cross-functional avionics programs from concept to flight. " * 6
+
+    def _fetch(self, jobs):
+        with patch("agents.job_agent.requests.get") as mock_get:
+            mock_get.return_value = MagicMock(status_code=200, json=lambda: {"jobs": jobs})
+            return _fetch_ashby_jobs("https://jobs.ashbyhq.com/cowboyspace")
+
+    def test_description_plain_becomes_prefetched_md(self):
+        job = {"id": "a1", "title": "Technical Program Manager, Avionics",
+               "location": "Greater Seattle Area", "department": "Engineering",
+               "team": "Avionics", "employmentType": "FullTime",
+               "publishedAt": "2026-08-14T10:00:00Z",
+               "descriptionHtml": "<p>" + self.LONG + "</p>",
+               "descriptionPlain": self.LONG}
+        r = self._fetch([job])[0]
+        self.assertEqual(r["_platform"], "Ashby")
+        md = r["_prefetched_md"]
+        self.assertIn("# Technical Program Manager, Avionics", md)
+        self.assertIn("**Location:** Greater Seattle Area", md)
+        self.assertIn("**Department:** Engineering", md)
+        self.assertIn("## Description", md)
+        self.assertIn("avionics programs", md)
+        self.assertNotIn("<p>", md)
+        self.assertEqual(r["posted_date"], "2026-08-14")  # unchanged fields
+
+    def test_html_only_description_is_tag_stripped(self):
+        job = {"id": "a2", "title": "TPM", "location": "Seattle, WA",
+               "descriptionHtml": "<div><h2>About</h2><p>" + self.LONG + "</p>&nbsp;</div>"}
+        md = self._fetch([job])[0]["_prefetched_md"]
+        self.assertIn("avionics programs", md)
+        self.assertNotIn("<h2>", md)
+        self.assertNotIn("&nbsp;", md)
+
+    def test_missing_or_short_description_leaves_scrape_path(self):
+        jobs = [{"id": "a3", "title": "TPM", "location": "Seattle, WA"},
+                {"id": "a4", "title": "TPM", "location": "Seattle, WA",
+                 "descriptionPlain": "Short."}]
+        for r in self._fetch(jobs):
+            self.assertNotIn("_prefetched_md", r)
+            self.assertNotIn("_platform", r)
+
+    async def test_route_scraper_uses_ashby_prefetch_without_browser(self):
+        from agents.job_agent import _route_scraper
+        url = "https://jobs.ashbyhq.com/cowboyspace/a1"
+        meta = {url: {"url": url, "_prefetched_md": "# TPM\n\n## Description\n" + self.LONG,
+                      "_platform": "Ashby"}}
+        crawler = MagicMock()
+        md, label = await _route_scraper(url, crawler, meta)
+        self.assertEqual(label, "Ashby")
+        self.assertIn("avionics programs", md)
+        crawler.arun.assert_not_called()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2339,6 +2402,27 @@ class TestTpmFilterTrackTitles(unittest.TestCase):
         kept = {l["url"] for l in _tpm_filter(self.LINKS)}
         self.assertNotIn("u3", kept)
 
+    def test_technical_program_management_titles_accepted_everywhere(self):
+        """REQ-171 (2026-08-22): Salesforce titles the function "Technical
+        Program Management" — live Workday titles below; 'manager' never
+        matched 'management', so every Salesforce TPM posting was dropped."""
+        from agents.job_agent import _tpm_filter
+        links = [
+            {"url": "s1", "title": "Senior Director - Technical Program Management, Field Service",
+             "location": "California - San Francisco"},
+            {"url": "s2", "title": "Director of Technical Program Management - Trust & Infrastructure",
+             "location": "Washington - Seattle"},
+            {"url": "s3", "title": "Senior Manager/ Director, Technical Program Management - AI Research",
+             "location": "California - San Francisco"},
+            # not TPM-family: generic program management / product
+            {"url": "s4", "title": "Senior Product Manager, Project & Program Management, Emerging Technology",
+             "location": "Seattle, WA"},
+            {"url": "s5", "title": "Bid Program Management Lead", "location": "Seattle, WA"},
+        ]
+        for track in ("", "Mid-large Tech", "Fintech", "AI-native", "Space"):
+            kept = {l["url"] for l in _tpm_filter(links, track)}
+            self.assertEqual(kept, {"s1", "s2", "s3"}, track)
+
 
 class TestSpaceTrackFloridaGeo(unittest.TestCase):
     """REQ-162: FL locations are kept on the Space track only — in both
@@ -2574,9 +2658,55 @@ class TestPrescrapeFreshnessGate(unittest.TestCase):
         from datetime import datetime, timedelta
         return (datetime.now().date() - timedelta(days=n)).strftime("%Y-%m-%d")
 
-    def _gate(self, to_process, list_meta, known=None):
+    def _gate(self, to_process, list_meta, known=None, track=""):
         from agents.job_agent import _apply_prescrape_freshness_gate
-        return _apply_prescrape_freshness_gate(to_process, list_meta, known or {})
+        return _apply_prescrape_freshness_gate(to_process, list_meta, known or {}, track)
+
+    # ── REQ-170 (2026-08-22): per-track first-seen window ──
+    def test_vertical_tracks_get_45_day_first_seen_window(self):
+        meta = {"u45": {"posted_date": self._days_ago(45)},
+                "u46": {"posted_date": self._days_ago(46)},
+                "u36": {"posted_date": self._days_ago(36)},  # Cowboy Space 07-17 on 08-22
+                "u15": {"posted_date": self._days_ago(15)}}
+        for track in ("Space", "AI-native", "Robotics", "Fintech", "Defense"):
+            kept, aged = self._gate(["u45", "u46", "u36", "u15"], meta, track=track)
+            self.assertEqual(kept, ["u45", "u36", "u15"], track)
+            self.assertEqual(aged, 1, track)
+
+    def test_midlarge_blank_and_custom_tracks_keep_14_day_window(self):
+        meta = {"u14": {"posted_date": self._days_ago(14)},
+                "u15": {"posted_date": self._days_ago(15)}}
+        for track in ("Mid-large Tech", "", "Custom Bucket"):
+            kept, aged = self._gate(["u14", "u15"], meta, track=track)
+            self.assertEqual(kept, ["u14"], repr(track))
+            self.assertEqual(aged, 1, repr(track))
+
+    def test_window_constants_and_helper(self):
+        from shared.config import FIRST_SEEN_MAX_AGE_DAYS, FIRST_SEEN_MAX_AGE_DAYS_VERTICAL
+        from agents.job_agent import _first_seen_max_age_days
+        # Mid-large window == freshness-tier ceiling (pinned boundary, REQ-004-10)
+        self.assertEqual(FIRST_SEEN_MAX_AGE_DAYS, 14)
+        self.assertGreater(FIRST_SEEN_MAX_AGE_DAYS_VERTICAL, FIRST_SEEN_MAX_AGE_DAYS)
+        self.assertEqual(_first_seen_max_age_days("Space"), FIRST_SEEN_MAX_AGE_DAYS_VERTICAL)
+        self.assertEqual(_first_seen_max_age_days("Mid-large Tech"), FIRST_SEEN_MAX_AGE_DAYS)
+        self.assertEqual(_first_seen_max_age_days(""), FIRST_SEEN_MAX_AGE_DAYS)
+
+    def test_invalid_calendar_date_is_unknown_not_aged(self):
+        """Regex-shaped but impossible date → unknown (keep), not aged-skip."""
+        meta = {"u_bad": {"posted_date": "2026-13-45"}}
+        kept, aged = self._gate(["u_bad"], meta)
+        self.assertEqual(kept, ["u_bad"])
+        self.assertEqual(aged, 0)
+
+    def test_vertical_row_older_than_14_days_has_no_tier_but_is_kept(self):
+        """Kept 15–45-day vertical rows carry tier None → sort tier 9 (visible
+        at the bottom, never dropped) — the documented REQ-170 trade-off."""
+        from shared.excel_store import compute_freshness_tier, compute_sort_tier
+        d = self._days_ago(20)
+        kept, _ = self._gate(["u20"], {"u20": {"posted_date": d}}, track="Space")
+        self.assertEqual(kept, ["u20"])
+        self.assertIsNone(compute_freshness_tier(d))
+        self.assertEqual(compute_sort_tier(compute_freshness_tier(d), "WA"), 9)
 
     def test_aged_new_posting_skipped_fresh_kept(self):
         meta = {"u_old": {"posted_date": self._days_ago(20)},
@@ -2960,12 +3090,13 @@ class TestFetchGoogleJobs(unittest.TestCase):
     AF_initDataCallback payload (design.md v3 API endpoint is dead)."""
 
     @staticmethod
-    def _job(job_id, title, locations, epoch=1782202073):
+    def _job(job_id, title, locations, epoch=1782202073, company="Google"):
         j = [None] * 21
         j[0] = job_id
         j[1] = title
         j[3] = [None, "<ul><li>Run programs.</li></ul>"]
         j[4] = [None, "<h3>Minimum qualifications:</h3><ul><li>BS degree</li></ul>"]
+        j[7] = company  # payload index 7 = hiring company (Google / DeepMind / YouTube)
         j[9] = [[loc, [loc], loc.split(",")[0], None, "WA", "US"]
                 for loc in locations]
         j[12] = [epoch, 0]
@@ -2978,14 +3109,62 @@ class TestFetchGoogleJobs(unittest.TestCase):
         return ("<html><script>AF_initDataCallback({key: 'ds:1', hash: '2', "
                 f"data:{payload}, sideChannel: {{}}}});</script></html>")
 
-    def _fetch(self, pages):
+    def _fetch(self, pages, career_url="https://www.google.com/about/careers/applications/"):
         """pages: list of HTML strings returned per successive GET."""
         from agents.job_agent import _fetch_google_jobs
         responses = [MagicMock(status_code=200, text=h) for h in pages]
         with patch("agents.job_agent._http_request_with_retry",
                    side_effect=responses) as mock_http:
-            result = _fetch_google_jobs("https://www.google.com/about/careers/applications/")
+            result = _fetch_google_jobs(career_url)
         return result, mock_http
+
+    # ── 2026-08-22 follow-up (BUG-83): honor the Career URL's company= params ──
+    _DM_URL = ("https://www.google.com/about/careers/applications/jobs/results"
+               "?company=DeepMind&utm_source=deepmind")
+    _GOOG_URL = ("https://www.google.com/about/careers/applications/jobs/results/"
+                 "?employment_type=FULL_TIME&company=DeepMind&company=YouTube"
+                 "&company=Google&q=%22technical%20program%20manager%22")
+
+    def test_company_params_forwarded_to_request(self):
+        jobs = [self._job("1", "TPM, Gemini", ["Mountain View, CA, USA"], company="DeepMind")]
+        _, mock_http = self._fetch([self._page_html(jobs)] * 2, career_url=self._GOOG_URL)
+        requested = mock_http.call_args_list[0].args[1]
+        self.assertIn("company=DeepMind", requested)
+        self.assertIn("company=YouTube", requested)
+        self.assertIn("company=Google", requested)
+        self.assertNotIn("utm_source", requested)  # only company= is forwarded
+        # the TPM query/location anchors are preserved
+        self.assertIn("technical+program+manager", requested)
+        self.assertIn("location=United+States", requested)
+
+    def test_no_company_param_requests_all_of_google(self):
+        jobs = [self._job("1", "TPM", ["Kirkland, WA, USA"])]
+        _, mock_http = self._fetch([self._page_html(jobs)] * 2)
+        self.assertNotIn("company=", mock_http.call_args_list[0].args[1])
+
+    def test_payload_rows_of_other_companies_dropped_when_company_set(self):
+        """Belt-and-braces: even if the server ignores company=, rows whose
+        payload company (index 7) is not in the requested set are dropped —
+        the DeepMind row must never absorb Google-wide postings."""
+        jobs = [self._job("1", "Staff TPM, GeminiApp", ["Mountain View, CA, USA"], company="DeepMind"),
+                self._job("2", "TPM II, Data Center", ["Kirkland, WA, USA"], company="Google"),
+                self._job("3", "TPM, Shorts", ["San Bruno, CA, USA"], company="YouTube")]
+        result, _ = self._fetch([self._page_html(jobs)] * 2, career_url=self._DM_URL)
+        self.assertEqual([j["title"] for j in result], ["Staff TPM, GeminiApp"])
+        self.assertIn("**Company:** DeepMind", result[0]["_prefetched_md"])
+
+    def test_company_filter_is_case_insensitive_and_keeps_unknown_company(self):
+        jobs = [self._job("1", "TPM A", ["Kirkland, WA, USA"], company="deepmind"),
+                self._job("2", "TPM B", ["Kirkland, WA, USA"], company=None)]
+        result, _ = self._fetch([self._page_html(jobs)] * 2, career_url=self._DM_URL)
+        # unknown payload company is kept (server-side filter already applied)
+        self.assertEqual([j["title"] for j in result], ["TPM A", "TPM B"])
+        self.assertIn("**Company:** Google", result[1]["_prefetched_md"])  # default label
+
+    def test_md_company_label_follows_payload_without_filter(self):
+        jobs = [self._job("1", "TPM, Shorts", ["San Bruno, CA, USA"], company="YouTube")]
+        result, _ = self._fetch([self._page_html(jobs)] * 2)
+        self.assertIn("**Company:** YouTube", result[0]["_prefetched_md"])
 
     def test_jobs_parsed_with_url_title_location_date(self):
         jobs = [self._job("111", "Technical Program Manager, AI Infrastructure",
@@ -3084,6 +3263,287 @@ class TestBug62EmptyExtractionAuditRow(unittest.IsolatedAsyncioTestCase):
         finally:
             if os.path.exists(path):
                 os.remove(path)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+class TestFetchMicrosoftJobs(unittest.TestCase):
+    """2026-08-22 follow-up (REQ-169): Microsoft careers moved to Eightfold
+    (apply.careers.microsoft.com); discovery via the public pcsx search API
+    instead of Path-B crawling of a JS SPA (which yielded ~1 row total)."""
+
+    TS = 1787241678  # epoch seconds, as the API reports postedTs
+
+    @classmethod
+    def _pos(cls, pid, name, locations, posted_ts=None):
+        ts = cls.TS if posted_ts is None else posted_ts
+        return {"id": pid, "displayJobId": pid, "name": name,
+                "locations": locations, "standardizedLocations": ["US"],
+                "postedTs": ts, "creationTs": ts - 86400,
+                "department": "Technical Program Management",
+                "positionUrl": f"/careers/job/{pid}"}
+
+    @staticmethod
+    def _page(positions, count):
+        return MagicMock(status_code=200, json=lambda: {
+            "status": 200, "error": {"message": ""},
+            "data": {"positions": positions, "count": count}})
+
+    def _fetch(self, responses, career_url="https://careers.microsoft.com/"):
+        import agents.job_agent as jm
+        from agents.job_agent import _fetch_microsoft_jobs
+        with patch("agents.job_agent._http_request_with_retry",
+                   side_effect=responses) as mock_http, \
+             patch.object(jm, "_MS_PAGE_SLEEP_SECS", 0), \
+             patch.object(jm, "_MS_429_BACKOFF_SECS", 0):
+            return _fetch_microsoft_jobs(career_url), mock_http
+
+    def test_routing_table_and_ats_trusted_path(self):
+        from agents.job_agent import ALL_ATS, _resolve_list_fn
+        cfg = ATS_PLATFORMS["microsoft"]
+        self.assertEqual(cfg["strategy"], "json_api")
+        self.assertEqual(cfg["list_fn"], "_fetch_microsoft_jobs")
+        self.assertIn("careers.microsoft.com", cfg["domains"])
+        self.assertTrue(callable(_resolve_list_fn("_fetch_microsoft_jobs")))
+        # Company_List URL (https://careers.microsoft.com/) takes the ATS-trusted
+        # path in process_company (no Path-B delay, title pre-filter only).
+        self.assertTrue(any(d in "https://careers.microsoft.com/" for d in ALL_ATS))
+        for u in ("https://careers.microsoft.com/",
+                  "https://apply.careers.microsoft.com/careers/job/1970393556957798",
+                  "https://jobs.careers.microsoft.com/global/en/job/12345"):
+            self.assertEqual(_match_ats(u)[0], "microsoft", u)
+
+    def test_request_targets_us_tpm_query(self):
+        _, mock_http = self._fetch([self._page([], 0)])
+        url = mock_http.call_args_list[0].args[1]
+        self.assertIn("apply.careers.microsoft.com/api/pcsx/search", url)
+        self.assertIn("domain=microsoft.com", url)
+        # quoted phrase: same TPM-titled set as the fuzzy query at 1/10 the pages
+        self.assertIn("query=%22technical%20program%20manager%22", url)
+        self.assertIn("location=United%20States", url)
+        self.assertIn("start=0", url)
+        # stable ordering across pages (relevance order repeats/skips rows)
+        self.assertIn("sort_by=timestamp", url)
+
+    def test_repeated_ids_across_pages_are_deduped(self):
+        p1 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10)]
+        p2 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(8, 13)]
+        result, _ = self._fetch([self._page(p1, 13), self._page(p2, 13)])
+        self.assertEqual(len(result), 13)
+        self.assertEqual(len({j["url"] for j in result}), 13)
+
+    def test_parses_url_title_location_date(self):
+        pos = self._pos("1970393556962266", "Technical Program Manager",
+                        ["United States, Washington, Redmond"])
+        result, _ = self._fetch([self._page([pos], 1)])
+        self.assertEqual(len(result), 1)
+        job = result[0]
+        self.assertEqual(job["url"],
+                         "https://apply.careers.microsoft.com/careers/job/1970393556962266")
+        self.assertEqual(job["title"], "Technical Program Manager")
+        # API emits Country, State, City — reordered to the City, State, Country
+        # form every other adapter and classify_region expect.
+        self.assertEqual(job["location"], "Redmond, Washington, United States")
+        from datetime import datetime as _dt
+        self.assertEqual(job["posted_date"], _dt.fromtimestamp(self.TS).strftime("%Y-%m-%d"))
+        self.assertNotIn("_prefetched_md", job)  # JD comes from the job page's JSON-LD
+
+    def test_live_location_forms_pass_the_downstream_gates(self):
+        """Lesson 2026-08-20: push the adapter's real location strings through
+        the gate they feed."""
+        from shared.excel_store import classify_region
+        positions = [
+            self._pos("1", "Senior Technical Program Manager - Azure Storage",
+                      ["United States, Multiple Locations, Multiple Locations"]),
+            self._pos("2", "Technical Program Manager - CTJ - Poly",
+                      ["United States, Virginia, Reston",
+                       "United States, Maryland, Annapolis Junction",
+                       "United States, Washington, Redmond"]),
+            self._pos("3", "Technical Program Manager II",
+                      ["United States, California, Mountain View"]),
+            self._pos("4", "Technical Program Manager", ["Canada, Ontario, Toronto"]),
+        ]
+        result, _ = self._fetch([self._page(positions, 4)])
+        locs = {j["title"]: j["location"] for j in result}
+        # placeholder-only location → "" → Unknown → kept (conservative)
+        self.assertEqual(locs["Senior Technical Program Manager - Azure Storage"], "")
+        self.assertEqual(classify_region(""), "Unknown")
+        self.assertEqual(locs["Technical Program Manager - CTJ - Poly"],
+                         "Reston, Virginia, United States; "
+                         "Annapolis Junction, Maryland, United States; "
+                         "Redmond, Washington, United States")
+        self.assertEqual(classify_region(locs["Technical Program Manager - CTJ - Poly"]), "WA")
+        self.assertEqual(classify_region(locs["Technical Program Manager II"]), "CA")
+        self.assertEqual(classify_region(locs["Technical Program Manager"]), "Other")
+        from agents.job_agent import _tpm_filter
+        kept = {j["title"] for j in _tpm_filter(result, "Mid-large Tech")}
+        self.assertEqual(kept, {"Senior Technical Program Manager - Azure Storage",
+                                "Technical Program Manager - CTJ - Poly",
+                                "Technical Program Manager II"})
+
+    def test_pagination_walks_count_in_pages_of_10(self):
+        p1 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10)]
+        p2 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10, 20)]
+        p3 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(20, 23)]
+        result, mock_http = self._fetch([self._page(p1, 23), self._page(p2, 23), self._page(p3, 23)])
+        self.assertEqual(len(result), 23)
+        self.assertEqual(mock_http.call_count, 3)
+        import re as _re
+        starts = [_re.search(r"start=(\d+)", c.args[1]).group(1) for c in mock_http.call_args_list]
+        self.assertEqual(starts, ["0", "10", "20"])
+
+    def test_count_reached_stops_without_extra_request(self):
+        p1 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10)]
+        result, mock_http = self._fetch([self._page(p1, 10)])
+        self.assertEqual(len(result), 10)
+        self.assertEqual(mock_http.call_count, 1)
+
+    def test_short_page_stops_pagination(self):
+        p1 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10)]
+        p2 = [self._pos("10", "TPM 10", ["United States, Washington, Redmond"])]
+        result, mock_http = self._fetch([self._page(p1, 528), self._page(p2, 528)])
+        self.assertEqual(len(result), 11)
+        self.assertEqual(mock_http.call_count, 2)
+
+    def test_http_failure_and_non_200_return_empty(self):
+        self.assertEqual(self._fetch([None])[0], [])
+        self.assertEqual(self._fetch([MagicMock(status_code=500, json=lambda: {})])[0], [])
+
+    def test_429_backs_off_and_rerequests_same_page(self):
+        """pcsx is burst-limited: a 429 must re-request the same `start`
+        (after a back-off) rather than silently truncating the walk — the
+        first live run stopped at 30 of 528 postings this way."""
+        p1 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10)]
+        p2 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10, 15)]
+        throttled = MagicMock(status_code=429, json=lambda: {})
+        result, mock_http = self._fetch([self._page(p1, 15), throttled, throttled, self._page(p2, 15)])
+        self.assertEqual(len(result), 15)
+        import re as _re
+        starts = [_re.search(r"start=(\d+)", c.args[1]).group(1) for c in mock_http.call_args_list]
+        self.assertEqual(starts, ["0", "10", "10", "10"])
+
+    def test_429_gives_up_after_max_retries(self):
+        throttled = MagicMock(status_code=429, json=lambda: {})
+        p1 = [self._pos(str(i), f"TPM {i}", ["United States, Washington, Redmond"]) for i in range(10)]
+        result, mock_http = self._fetch([self._page(p1, 40)] + [throttled] * 4)
+        self.assertEqual(len(result), 10)
+        self.assertEqual(mock_http.call_count, 5)  # 1 page + 3 retries + final give-up
+
+    def test_missing_posted_ts_is_unknown_date(self):
+        pos = self._pos("9", "TPM", ["United States, Washington, Redmond"])
+        pos["postedTs"] = None
+        pos["creationTs"] = None
+        result, _ = self._fetch([self._page([pos], 1)])
+        self.assertEqual(result[0]["posted_date"], "")
+
+
+class TestWorkdayLocationFromPath(unittest.TestCase):
+    """2026-08-22 cosmetic follow-up: "N Locations" fallback renders the URL
+    location slug; `---` (" - " separator) slugs no longer produce
+    "California, , , San, Francisco". Geo classification asserted per the
+    2026-08-20 lesson."""
+
+    def test_triple_hyphen_separator_form(self):
+        from agents.job_agent import _workday_location_from_path
+        from shared.excel_store import classify_region
+        loc = _workday_location_from_path(
+            "/job/California---San-Francisco/Director-of-TPM_JR123")
+        self.assertEqual(loc, "California, San Francisco")
+        self.assertEqual(classify_region(loc), "CA")
+        loc2 = _workday_location_from_path("/job/Washington---Seattle/TPM_JR9")
+        self.assertEqual(loc2, "Washington, Seattle")
+        self.assertEqual(classify_region(loc2), "WA")
+
+    def test_legacy_comma_dropped_form_unchanged(self):
+        from agents.job_agent import _workday_location_from_path
+        from shared.excel_store import classify_region
+        loc = _workday_location_from_path("/job/US-CA-Santa-Clara/Senior-TPM_JR1")
+        self.assertEqual(loc, "US, CA, Santa, Clara")  # state token preserved
+        self.assertEqual(classify_region(loc), "CA")
+        self.assertEqual(_workday_location_from_path("/job/Israel-Yokneam/x_1"),
+                         "Israel, Yokneam")
+
+    def test_no_slug_returns_empty_and_fetch_keeps_placeholder(self):
+        from agents.job_agent import _workday_location_from_path
+        self.assertEqual(_workday_location_from_path("/nope"), "")
+        self.assertEqual(_workday_location_from_path(""), "")
+
+    def test_fetch_workday_uses_helper_for_n_locations(self):
+        import agents.job_agent as jm
+        page = MagicMock(status_code=200, json=lambda: {"total": 2, "jobPostings": [
+            {"title": "TPM A", "externalPath": "/job/California---San-Francisco/TPM-A_JR1",
+             "locationsText": "4 Locations", "postedOn": "Posted Today"},
+            {"title": "TPM B", "externalPath": "/job/Washington---Seattle/TPM-B_JR2",
+             "locationsText": "Washington - Seattle", "postedOn": "Posted Today"}]})
+        with patch("agents.job_agent._http_request_with_retry", return_value=page):
+            jobs = jm._fetch_workday_jobs("https://acme.wd5.myworkdayjobs.com/External")
+        locs = {j["title"]: j["location"] for j in jobs}
+        self.assertEqual(locs["TPM A"], "California, San Francisco")
+        self.assertEqual(locs["TPM B"], "Washington - Seattle")  # real text untouched
+
+
+class TestDetectAtsAdapterOnlyPlatforms(unittest.TestCase):
+    """BUG-84: ATS_PLATFORMS entries whose discovery is an adapter (Amazon /
+    Google / Microsoft — slug_pattern None or no board_url_template) are not
+    detectable boards; a Path-B page linking to them must not crash
+    _detect_ats (re.search(None) TypeError / None.format AttributeError)."""
+
+    def test_adapter_only_links_are_skipped_not_crashing(self):
+        from agents.job_agent import _detect_ats
+        links = [
+            {"url": "https://www.amazon.jobs/en/jobs/123/tpm"},
+            {"url": "https://www.google.com/about/careers/applications/jobs/results/1-tpm"},
+            {"url": "https://apply.careers.microsoft.com/careers/job/1970393556957798"},
+        ]
+        self.assertEqual(_detect_ats(links), {})
+
+    def test_real_board_still_detected_after_adapter_links(self):
+        from agents.job_agent import _detect_ats
+        links = [
+            {"url": "https://www.amazon.jobs/en/jobs/123/tpm"},
+            {"url": "https://boards.greenhouse.io/acme/jobs/1"},
+        ]
+        self.assertEqual(_detect_ats(links)["platform"], "greenhouse")
+
+
+class TestMicrosoftJdJsonLdFirst(unittest.TestCase):
+    """2026-08-22: Eightfold job pages embed a JobPosting JSON-LD (description +
+    datePosted); it is tried first (free, deterministic) before Firecrawl."""
+
+    HTML = ('<html><script type="application/ld+json">{"@context":"https://schema.org",'
+            '"@type":"JobPosting","title":"Senior Technical Program Manager - Azure Storage",'
+            '"datePosted":"2026-08-20T20:22:49","description":"<p>Manage large, complex Azure '
+            'storage technology initiatives across HPC and ML workloads.</p>",'
+            '"jobLocation":{"@type":"Place","address":{"@type":"PostalAddress",'
+            '"addressCountry":{"@type":"Country","name":"US"},"addressLocality":""}}}'
+            '</script></html>')
+
+    def test_jsonld_used_before_firecrawl(self):
+        import agents.job_agent as jm
+        from agents.job_agent import _scrape_microsoft_jd
+        url = "https://apply.careers.microsoft.com/careers/job/1970393556957798"
+        pool = _FakeFcPool(scrape_return=MagicMock(markdown="x" * 500))
+        with patch("agents.job_agent._FC_POOL", pool), \
+             patch("agents.job_agent.requests.get") as mock_get, \
+             patch.dict(jm._JSONLD_DATE_BY_URL, {}, clear=True):
+            mock_get.return_value = MagicMock(status_code=200, text=self.HTML)
+            text = _scrape_microsoft_jd(url)
+            self.assertIn("Azure storage technology initiatives", text)
+            self.assertIn("Senior Technical Program Manager - Azure Storage", text)
+            pool.scrape.assert_not_called()
+            self.assertEqual(jm._JSONLD_DATE_BY_URL.get(url), "2026-08-20")
+
+    def test_nested_address_country_object_parses(self):
+        """BUG-85: schema.org nested Country/Region objects must not crash the
+        shared JSON-LD parser (it silently disabled JSON-LD for Eightfold)."""
+        from agents.job_agent import _parse_jsonld_jobposting
+        html = ('<script type="application/ld+json">{"@type":"JobPosting",'
+                '"title":"TPM","description":"<p>Do things.</p>",'
+                '"jobLocation":[{"@type":"Place","address":{"@type":"PostalAddress",'
+                '"addressLocality":"Redmond","addressRegion":{"@type":"State","name":"WA"},'
+                '"addressCountry":{"@type":"Country","name":"US"}}}]}</script>')
+        parsed = _parse_jsonld_jobposting(html)
+        self.assertEqual(parsed["description"], "Do things.")
+        self.assertEqual(parsed["location"], "Redmond, WA, US")
 
 
 if __name__ == "__main__":

@@ -1,5 +1,68 @@
 # CHANGELOG
 
+## 2026-08-22 (open follow-ups cleared — BUG-83~85, REQ-168~172)
+
+The five follow-ups left after the 08-20/21 job-agent result review, worked
+as one batch (live probes of public endpoints first, repro tests before each
+fix). Full suite 1,149 → 1,165+ passed / 1 skipped.
+
+### Google labeling (BUG-83)
+- `_fetch_google_jobs` honors the Career URL's `company=` params (repeatable):
+  forwarded to the request (server-side filter — DeepMind 4 / YouTube 7 /
+  Google 280 vs 291 unfiltered, verified live) and re-checked against the
+  payload's company field (index 7); `**Company:**` in the prefetched JD text
+  follows the payload. The "Google DeepMind" row no longer absorbs Google-wide
+  postings; the "Google" row (`company=DeepMind&company=YouTube&company=Google`)
+  picks up the rest.
+
+### Microsoft discovery adapter (REQ-169)
+- `careers.microsoft.com` runs on Eightfold (`apply.careers.microsoft.com`);
+  new `_fetch_microsoft_jobs` walks the public
+  `GET /api/pcsx/search?domain=microsoft.com&query="technical program manager"&location=United States&sort_by=timestamp&start=N&num=10`
+  (quoted phrase → ~49 rows / 5 pages with the same 37 TPM-titled postings
+  as the 527-row fuzzy walk, verified by id set; `sort_by=timestamp` because
+  relevance order repeats/skips rows across pages; ids de-duplicated;
+  10/page hard cap, `data.count` total, `postedTs` epoch-s, `positionUrl`
+  → `https://apply.careers.microsoft.com/careers/job/{id}`; "Country, State,
+  City" locations reordered to "City, State, Country", placeholder "Multiple
+  Locations" → Unknown/keep). Burst rate limit: 2 s pacing + 15 s back-off and
+  same-page retry on 429. `ATS_PLATFORMS["microsoft"]` → `json_api` with
+  `domains=["careers.microsoft.com"]` (ATS-trusted path, no Path-B delay).
+- `_scrape_microsoft_jd`: Eightfold job pages embed a JobPosting JSON-LD
+  (description + `datePosted`) → plain GET tried first, Firecrawl
+  `only_main_content=True` remains the fallback.
+- `_detect_ats` hardened (BUG-84) and `_parse_jsonld_jobposting` accepts
+  nested `addressCountry`/`addressRegion` objects (BUG-85) — both found
+  while wiring the adapter.
+
+### Freshness first-seen window per track (REQ-170)
+- `shared/config.py`: `FIRST_SEEN_MAX_AGE_DAYS = 14` (Mid-large Tech / blank /
+  custom) and `FIRST_SEEN_MAX_AGE_DAYS_VERTICAL = 45` (AI-native / Robotics /
+  Fintech / Space / Defense). `_apply_prescrape_freshness_gate(..., track)`
+  skips a first-seen posting only when its list-API date is older than the
+  track's window; regex-shaped but invalid dates ("2026-13-45") are now
+  unknown/keep (were aged-skip). Kept rows older than 14 days have no
+  freshness tier → sort tier 9 (bottom, visible). Motivating case: Cowboy
+  Space "TPM, Avionics" (07-17) was 36 days old — 30 would still have lost it.
+  User-confirmed 2026-08-22 (one constant to change if ever needed).
+- Workday "N Locations" fallback: `_workday_location_from_path` renders
+  `---` slugs as "California, San Francisco" (was "California, , , San,
+  Francisco"); comma-dropped slugs keep the legacy rendering (state token
+  preserved for geo).
+
+### Salesforce / "Technical Program Management" titles (REQ-171)
+- Salesforce's Workday search coverage was fine (422 "Program Manager" / 263
+  "Technical Program Manager" / 1,530 total, probed live); the postings are
+  titled "… Technical Program Management …" and `TPM_KW`'s "manager"
+  substrings never matched "management". `TPM_KW` + "technical program
+  management" on all tracks → Salesforce 0 → 3 TPM candidates live.
+
+### Ashby prefetched JD (REQ-172)
+- `_fetch_ashby_jobs` carries `descriptionPlain` (fallback: tag-stripped
+  `descriptionHtml`) as `_prefetched_md` (+`_platform: "Ashby"`) when ≥200
+  chars; `_route_scraper` serves it with zero browser/Firecrawl calls (Cowboy
+  Space: 71/71 prefetched; previously 3 Crawl4AI passes per run).
+
 ## 2026-08-21 (auto-archive feature removed — REQ-167)
 
 User decision: a company with no TPM openings today may publish one

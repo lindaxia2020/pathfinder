@@ -7,10 +7,10 @@
 | Priority | Open | Fixed |
 |----------|------|-------|
 | P0 Critical | 0 | 7 (BUG-01~03, BUG-32~33, BUG-56, BUG-65) |
-| P1 High      | 0 | 25 (BUG-04~11, BUG-27~28, BUG-34~38, BUG-66~67, BUG-73~75, BUG-78~82) |
-| P2 Medium    | 0 | 30 (BUG-12~20, BUG-29~30, BUG-39~49, BUG-55, BUG-68~72, BUG-76~77) |
+| P1 High      | 0 | 26 (BUG-04~11, BUG-27~28, BUG-34~38, BUG-66~67, BUG-73~75, BUG-78~83) |
+| P2 Medium    | 0 | 32 (BUG-12~20, BUG-29~30, BUG-39~49, BUG-55, BUG-68~72, BUG-76~77, BUG-84~85) |
 | P3 Low       | 6 (BUG-57~61, BUG-63) | 14 (BUG-21~26, BUG-31, BUG-50~54, BUG-62, BUG-64) |
-| **Total** | **6** | **76** |
+| **Total** | **6** | **79** |
 
 ---
 
@@ -222,3 +222,24 @@
 | BUG-82 | `shared/excel_store.py` `_classify_region_segment` (`_SEG_SEP_RE` / `_LEADING_STATE_RE` new; token-based remote rule); `agents/job_agent.py` `_gate_and_finalize` / `_process_scraped_jd` / `process_company` (`list_location` threaded) | **Write-time geo gate dropped in-scope rows on LLM location formatting.** Blue Origin's Workday JSON-LD location is `"WA - Landmark (Ride East), United States of America"`; Gemini keeps it verbatim for some JDs and rewrites it to `"Landmark (Ride East), WA, …"` for others. The rewritten form → WA → written; the verbatim form → Other → dropped (`TPM III – Software Development`, `Technical Project Manager II`, the `CA - Remote` TeraWave roles) even though the list API had already geo-qualified the same posting ("Greater Seattle Area") pre-scrape. `classify_region` also returned Other for `US - Remote` / `Remote - US` / `Remote (United States)` / `Remote, US, East Coast`. Fix (a): segments are normalized before classification (`- – — / \| ( )` → `, `), a leading state code (`WA,` / `CA,` / `TX,` / `FL,`) maps directly, and the remote rule is token-based (bare "remote" or remote + any `_US_REMOTE_QUALIFIERS` token → Remote; remote + other tokens falls through to the state rules — "Remote, California" → CA, "Remote, Canada" → Other). Fix (b) belt-and-braces: `_gate_and_finalize` receives the list-API `location` (`list_location`, threaded from `process_company`'s `list_meta` via `_process_scraped_jd`) and drops a row only when BOTH the extracted and the list location are out of scope — never on LLM formatting alone; retry path passes none (unchanged strictness). Repro: `TestClassifyRegion.test_leading_state_code_and_separator_variants`, `TestWriteTimeGates.test_list_location_rescues_out_of_scope_extracted_location`. | Fixed |
 
 > **Policy change (not a bug) — REQ-166**: YoE gate now skips only stated min ≥11 (was ≤3 or ≥12). Cowboy Space "Technical Program Manager" (2-5 yrs, Greater Seattle Area) is the motivating case. `TestWriteTimeGates.test_yoe_boundary_table` updated.
+
+---
+
+## 2026-08-22 Open follow-ups clearance (from the 08-20/21 result review)
+
+> The five follow-ups left in `tasks/todo.md` after BUG-79~82 were worked in one batch. Live probes (public endpoints only) first; repro tests before each fix. Three were bugs (below); the rest are requirement/policy changes (REQ-169~172, see REQUIREMENTS §9.17).
+
+### P1 — High
+
+| # | File | Description | Status |
+|---|------|-------------|--------|
+| BUG-83 | `agents/job_agent.py` `_fetch_google_jobs` | **Google Careers adapter ignored the Career URL's `company=` params and always searched the whole Google board.** Google Careers hosts Google / DeepMind / YouTube / … on one board; the "Google DeepMind" row (AI-native, processed first by track order) absorbed all ~51 Google-wide TPM postings (0 DeepMind titles), forced Job Domain "AI" on them and let plain-PM titles through the AI-native rule, while the "Google" (Mid-large Tech) row then found nothing new. Live probe 2026-08-22: `company=` filters server-side (DeepMind 4 / YouTube 7 / Google 280 vs 291 unfiltered) and the payload carries the hiring company at index 7. Fix: `company=` values (repeatable) are parsed from the Career URL, forwarded on every request, and re-checked against `job[7]` (case-insensitive; unknown payload company kept); `**Company:**` in the prefetched markdown now follows the payload. No `company=` → whole board, as before. Repro: `TestFetchGoogleJobs.test_company_params_forwarded_to_request` / `test_payload_rows_of_other_companies_dropped_when_company_set`. Live: DeepMind URL → 4 postings, all labeled DeepMind. | Fixed |
+
+### P2 — Medium
+
+| # | File | Description | Status |
+|---|------|-------------|--------|
+| BUG-84 | `agents/job_agent.py` `_detect_ats` | **Path-B ATS detection crashed on links to adapter-only platforms.** `ATS_PLATFORMS` entries whose discovery is an adapter (Amazon: `board_url_template` None; Google/Microsoft: `slug_pattern` None) are not detectable boards, but `_detect_ats` iterated them like any other: `re.search(None, href)` → `TypeError`, `None.format(...)` → `AttributeError` whenever a crawled page linked to amazon.jobs / Google Careers (and, as of REQ-169, `careers.microsoft.com`). Latent since the Amazon adapter (REQ-004-17); surfaced while giving Microsoft a non-empty `domains` list. Fix: skip entries without `slug_pattern`, and non-Workday entries without `board_url_template`. Repro: `TestDetectAtsAdapterOnlyPlatforms`. | Fixed |
+| BUG-85 | `agents/job_agent.py` `_parse_jsonld_jobposting._fmt_addr` | **Shared JSON-LD parser crashed on schema.org nested address objects** — `addressCountry: {"@type": "Country", "name": "US"}` (valid schema.org; exactly what Eightfold/Microsoft emits) hit `", ".join(...)` with a dict → `TypeError`. Every JSON-LD scraper wraps the parse in a broad `except`, so the failure was silent: the page fell through to Firecrawl / the browser and the BUG-67 date stash never got `datePosted`. Fix: `_fmt_addr` unwraps dict values (`name`) for locality/region/country and tolerates a non-dict address. Repro: `TestMicrosoftJdJsonLdFirst.test_nested_address_country_object_parses`. | Fixed |
+
+> **Requirement/policy changes in the same batch (not bugs)** — REQ-169 Microsoft Eightfold `pcsx/search` discovery adapter + JSON-LD-first JD scrape (Path B yielded ~1 row/run); REQ-170 per-track first-seen freshness window (Mid-large 14 d, vertical tracks 45 d — the Cowboy Space "TPM, Avionics" 07-17 posting was 36 days old when this landed); REQ-171 `TPM_KW` + "technical program management" (Salesforce titles the function that way; its Workday search returned the postings, the title filter dropped all of them); REQ-172 Ashby `descriptionPlain`/`descriptionHtml` → `_prefetched_md` (Cowboy Space: 71/71 jobs prefetched, zero browser renders).

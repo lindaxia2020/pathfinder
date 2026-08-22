@@ -1,14 +1,17 @@
 # Task Tracker
 
-## Open follow-ups (as of 2026-08-21 — each is its own small plan; start a fresh session per item)
+## Completed (2026-08-22): All five 08-21 open follow-ups cleared (BUG-83~85, REQ-168~172)
 
-Context: all items below were found during the 2026-08-20/21 job-agent result review (BUG-79~82, REQ-163~166 — see CHANGELOG 2026-08-20/21). Code for those is in the working tree (commit it first if not yet committed).
+**Trigger**: user asked to fix the open to-dos. Live probes (public endpoints only, no paid APIs) first; repro tests before each fix. Full suite 1,165 passed / 1 skipped. **Not committed yet.**
 
-- [ ] **Google labeling** (`agents/job_agent.py:_fetch_google_jobs`): ignores the Career URL's `company=` param and searches all of Google US → the first-processed Google row ("Google DeepMind", AI-native) absorbs all ~51 Google-wide TPM postings (0 titles mention DeepMind); the "Google" (Mid-large Tech) row then finds nothing new; Job Domain forced "AI"; plain-PM titles leak via the AI-native rule. Fix idea: honor `company=` (filter payload rows by company field) or merge the two rows.
-- [ ] **Microsoft list adapter**: `careers.microsoft.com` routes to Path B (Firecrawl + Crawl4AI on a JS SPA) → ~nothing (1 row total). Needs an adapter like Amazon/Google. `gcsservices.careers.microsoft.com/search/api/v1/search` gave a TLS name mismatch from this host on 2026-08-20 — find the endpoint the SPA actually calls. Locations are "City, Washington, United States" (now handled by BUG-79).
-- [ ] **Freshness gate policy**: ≥15-day-old postings are never written on first sight (`_apply_prescrape_freshness_gate`, REQ-004-10). Cowboy Space "TPM, Avionics" (07-17) was lost this way. Decide whether small/vertical companies get a longer first-seen window.
-- [ ] **Salesforce Workday sanity**: `searchText="Program Manager"` returns 421 postings but 0 TPM titles after `_tpm_filter` — verify the search covers "Technical Program Manager" titles (compare with a direct `searchText="Technical Program Manager"` probe).
-- [ ] **Ashby prefetched JD**: the Ashby job-board API already returns `descriptionHtml`; carrying it as `_prefetched_md` (like Amazon) would remove the Crawl4AI render for Ashby JDs (Cowboy Space took 3 browser passes). Optimization, low priority.
+- [x] Google labeling (BUG-83 / REQ-168): `company=` params honored (request + payload index 7); live DeepMind URL → 4 postings, all labeled DeepMind
+- [x] Microsoft adapter (REQ-169): Eightfold `apply.careers.microsoft.com/api/pcsx/search` (domain=microsoft.com, 10/page; quoted phrase query → 49 rows/5 pages = same 37 TPM-titled as the 527-row fuzzy walk; `sort_by=timestamp` — relevance order unstable across pages); 2 s pacing + 429 same-page back-off (first live walk truncated at 30/528 at 1 s pacing); live: 35 TPM candidates after filters (27 WA) vs ~1 row before; JSON-LD-first `_scrape_microsoft_jd` (live JD 3,138 chars); found+fixed BUG-84 (`_detect_ats` crash on adapter-only platforms) and BUG-85 (JSON-LD nested `addressCountry` object crashed the shared parser silently)
+- [x] Salesforce (REQ-171): search coverage fine; titles are "… Technical Program Management …" → `TPM_KW` widened; live 0 → 3 candidates
+- [x] Ashby prefetched JD (REQ-172): `descriptionPlain`/`descriptionHtml` → `_prefetched_md`; live Cowboy Space 71/71 prefetched
+- [x] Freshness window (REQ-170): vertical tracks 45 d (Cowboy Space 07-17 was 36 d old; 30 would still lose it), Mid-large 14 d; `shared/config.py` constants; **user confirmed 45 (2026-08-22)**
+- [x] Docs: BUGS (BUG-83~85 + summary), CHANGELOG, REQUIREMENTS §9.17 + v2.11, ARCHITECTURE v2.6 + §3.2, CLAUDE.md, lessons
+- [x] Workday "N Locations" fallback: `_workday_location_from_path` — `---` slugs → "California, San Francisco"; comma-dropped slugs unchanged (+4 tests)
+- [ ] Commit the batch (user to confirm)
 
 ## Completed (2026-08-21): Auto-archive feature removed (REQ-167)
 
@@ -42,7 +45,7 @@ Context: all items below were found during the 2026-08-20/21 job-agent result re
 - [x] BUG-81 `_fetch_workday_jobs`: `total` from page 0 only (later pages report 0) — pagination was capped at 40 for every Workday company
 - [x] Repro tests first (3 failing → green); full suite run
 - [x] Docs: BUGS (BUG-79~81 + summary), CHANGELOG, REQUIREMENTS §9.14 (REQ-163/164, v2.8), ARCHITECTURE v2.3, lessons
-- [ ] Follow-ups — see "## Open follow-ups" section at top of this file
+- [x] Follow-ups — cleared 2026-08-22 (see top of file)
 
 
 ## Completed (2026-08-19): Filter widening — titles + WA geo (REQ-160/161)

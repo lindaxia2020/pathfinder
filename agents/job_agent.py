@@ -35,13 +35,14 @@ from shared.excel_store import (
     get_jd_urls, upsert_jd_record, batch_upsert_jd_records,
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
     sort_jd_tracker_by_tier,
-    JOB_DOMAIN_VALUES, classify_region, compute_freshness_tier,
+    JOB_DOMAIN_VALUES, classify_region,
 )
 
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.firecrawl_pool import build_pool_from_env
 from shared.rate_limiter import _RateLimiter
-from shared.config import MODEL, JD_CACHE_DIR
+from shared.config import (MODEL, JD_CACHE_DIR, FIRST_SEEN_MAX_AGE_DAYS,
+                           FIRST_SEEN_MAX_AGE_DAYS_VERTICAL)
 from shared.prompts import SECURITY_CLAUSE
 from shared.run_summary import RunSummary
 from shared.exceptions import GeminiTransientError
@@ -293,16 +294,20 @@ ATS_PLATFORMS = {
         "jd_fn":              "_scrape_google_jd",
     },
     "microsoft": {
-        # Microsoft careers is a JS SPA at jobs.careers.microsoft.com (current)
-        # and careers.microsoft.com (legacy). Like Google, Crawl4AI captures
-        # the sidebar list which contaminates Gemini extraction. Firecrawl with
-        # only_main_content=True isolates the actual JD body.
-        "domains":            [],
+        # 2026-08-22 (REQ-169): Microsoft careers runs on Eightfold —
+        # apply.careers.microsoft.com (jobs.careers.microsoft.com and
+        # careers.microsoft.com redirect there). Discovery via the public
+        # pcsx search API (_fetch_microsoft_jobs) replaces Path-B crawling of
+        # the JS SPA (~1 row per run). "careers.microsoft.com" substring-
+        # matches all three hosts. JD: Eightfold job pages embed a JobPosting
+        # JSON-LD (tried first, plain GET); Firecrawl only_main_content=True
+        # remains the fallback for pages without it.
+        "domains":            ["careers.microsoft.com"],
         "jd_domains":         ["jobs.careers.microsoft.com", "careers.microsoft.com"],
         "board_url_template": None,
         "slug_pattern":       None,
-        "strategy":           "custom",
-        "list_fn":            None,
+        "strategy":           "json_api",
+        "list_fn":            "_fetch_microsoft_jobs",
         "jd_fn":              "_scrape_microsoft_jd",
     },
     "tesla": {
@@ -397,7 +402,13 @@ TPM_KW = ["technical program manager", "tpm", "technical program mgr",
           # 2026-08-19 widening: many companies title the same role
           # "Technical Project Manager" — accepted on every track.
           "technical project manager", "technical project mgr",
-          "tech project manager"]
+          "tech project manager",
+          # 2026-08-22 (REQ-171): Salesforce (and others) title the function
+          # "… Technical Program Management …" ("Director of Technical Program
+          # Management - Trust & Infrastructure") — the substring "manager"
+          # never matched "management", so every Salesforce TPM posting was
+          # dropped by _tpm_filter although the Workday search returned them.
+          "technical program management"]
 
 # 2026-08-19 widening: at these vertical tracks a plain "Program Manager"
 # title is usually a technical program role (small orgs, loose titling), so
@@ -527,14 +538,47 @@ def _fetch_ashby_jobs(career_url: str) -> list:
                 loc = loc.get("name", "")
             loc = str(loc or "").strip()
             if job_url and title:
-                results.append({"url": job_url, "title": title, "location": loc,
-                                "posted_date": _parse_iso_date(
-                                    job.get("publishedDate") or job.get("publishedAt"))})
+                rec = {"url": job_url, "title": title, "location": loc,
+                       "posted_date": _parse_iso_date(
+                           job.get("publishedDate") or job.get("publishedAt"))}
+                # REQ-172: the job-board API already carries the JD body —
+                # prefetch it (like Amazon/Google) so Ashby JDs never need a
+                # browser render (Cowboy Space took 3 Crawl4AI passes per run).
+                md = _ashby_prefetched_md(job, title, loc)
+                if md:
+                    rec["_prefetched_md"] = md
+                    rec["_platform"] = "Ashby"
+                results.append(rec)
         logging.info(f"[Ashby API] {len(results)} jobs for {slug}")
         return results
     except (ValueError, KeyError, TypeError) as e:
         logging.error(f"[Ashby API] parse error for {api_url}: {type(e).__name__}: {e}")
         return []
+
+def _ashby_prefetched_md(job: dict, title: str, location: str) -> str:
+    """REQ-172: build prefetched JD markdown from an Ashby job-board record.
+    Prefers `descriptionPlain`, falls back to tag-stripped `descriptionHtml`;
+    returns "" when the body is missing/too short (<200 chars) so the caller
+    leaves the normal scrape path in place. No Company line — process_company
+    already passes the Company_List name to extract_jd."""
+    desc = str(job.get("descriptionPlain") or "").strip()
+    if not desc:
+        html = str(job.get("descriptionHtml") or "")
+        desc = re.sub(r"<[^>]+>", " ", html)
+        desc = re.sub(r"&[a-z]+;|&#\d+;", " ", desc)
+        desc = re.sub(r"[ \t]+", " ", desc).strip()
+    if len(desc) < 200:
+        return ""
+    parts = [f"# {title}"]
+    if location:
+        parts.append(f"**Location:** {location}")
+    for label, key in (("Department", "department"), ("Team", "team"),
+                       ("Employment Type", "employmentType")):
+        if job.get(key):
+            parts.append(f"**{label}:** {job[key]}")
+    parts.append(f"## Description\n{desc[:12000]}")
+    return "\n\n".join(parts)
+
 
 def _format_workable_location(job: dict) -> str:
     """Build a location string from Workable's multi-field shape.
@@ -696,6 +740,29 @@ def _parse_workday_posted_on(text: str, today=None) -> str:
     return (today - timedelta(days=days)).strftime("%Y-%m-%d")
 
 
+def _workday_location_from_path(path: str) -> str:
+    """Recover a display location from a Workday job path's location slug
+    (used when `locationsText` is the placeholder "N Locations").
+
+    Workday slugifies the primary location's display text: spaces → "-" and
+    commas dropped ("US, CA, Santa Clara" → `US-CA-Santa-Clara`), and a
+    " - " separator → `---` (Salesforce "California - San Francisco" →
+    `California---San-Francisco`). A single "-" is therefore ambiguous
+    (space or dropped comma); the legacy "-" → ", " rendering is kept for
+    slugs without `---` because it preserves the state token classify_region
+    keys on ("US, CA, Santa, Clara" → CA). Slugs WITH `---` use that as the
+    segment separator and treat inner hyphens as spaces — "California, San
+    Francisco" instead of the former "California, , , San, Francisco"."""
+    m = re.search(r'/job/([^/]+)/', path or "")
+    if not m:
+        return ""
+    slug = m.group(1)
+    if "---" in slug:
+        segs = [s.replace("-", " ").strip() for s in slug.split("---")]
+        return ", ".join(s for s in segs if s)
+    return ", ".join(t for t in slug.split("-") if t)
+
+
 def _fetch_workday_jobs(career_url: str) -> list:
     """
     Workday exposes an undocumented but widely-used POST JSON API.
@@ -765,12 +832,9 @@ def _fetch_workday_jobs(career_url: str) -> list:
             path  = p.get("externalPath", "")
             title = (p.get("title", "") or "").strip()
             loc   = p.get("locationsText", "") or ""
-            # For "N Locations", fall back to the country/city in the URL path
-            # e.g. /job/Israel-Yokneam/... → "Israel-Yokneam"
+            # For "N Locations", fall back to the location slug in the URL path
             if re.match(r'^\d+\s+location', loc.lower()):
-                url_loc_m = re.search(r'/job/([^/]+)/', path)
-                if url_loc_m:
-                    loc = url_loc_m.group(1).replace('-', ', ')
+                loc = _workday_location_from_path(path) or loc
             if path and title:
                 results.append({"url": base + path, "title": title, "location": loc,
                                  "posted_date": _parse_workday_posted_on(p.get("postedOn", "")),
@@ -791,6 +855,14 @@ def _detect_ats(links: list) -> dict:
     for lnk in links:
         href = lnk.get("url","") or lnk.get("href","")
         for pname, pcfg in ATS_PLATFORMS.items():
+            # BUG-84: adapter-only platforms (Amazon / Google / Microsoft) have
+            # no slug_pattern / board_url_template — they are not detectable
+            # boards; skipping them avoids re.search(None) / None.format crashes
+            # when a Path-B page links to one of them.
+            if not pcfg.get("slug_pattern"):
+                continue
+            if pname != "workday" and not pcfg.get("board_url_template"):
+                continue
             if any(d in href for d in pcfg["domains"]):
                 m = re.search(pcfg["slug_pattern"], href)
                 if not m: continue
@@ -972,13 +1044,25 @@ def _fetch_google_jobs(career_url: str) -> list:
 
     Note: Google clamps page=N to the last page (repeats its results), so
     pagination stops when a page yields no NEW job ids, not on an empty page.
+
+    BUG-83 (2026-08-22): the Career URL's `company=` params (Google Careers
+    hosts Google / DeepMind / YouTube / Fitbit … on one board) are honored:
+    forwarded to the request (server-side filter, verified live: DeepMind 4 /
+    YouTube 7 / Google 280 vs 291 unfiltered) AND re-checked against the
+    payload's company field (index 7) so a "Google DeepMind" Company_List
+    row never absorbs Google-wide postings. No `company=` → whole board.
     """
+    import urllib.parse
     # 2026-08-19 title widening: exact-phrase query deliberately kept —
     # Google is Mid-large Tech (generic PM out of scope) and titles TPM
     # roles "Technical Program Manager" consistently; unquoting would
     # multiply result pages for no recall gain.
     _BASE = ("https://www.google.com/about/careers/applications/jobs/results"
              "?q=%22technical+program+manager%22&location=United+States")
+    companies = [c.strip() for c in urllib.parse.parse_qs(
+        urllib.parse.urlparse(career_url or "").query).get("company", []) if c.strip()]
+    _BASE += "".join(f"&company={urllib.parse.quote(c)}" for c in companies)
+    wanted = {c.lower() for c in companies}
     _HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                               "AppleWebKit/537.36 (KHTML, like Gecko) "
                               "Chrome/120.0.0.0 Safari/537.36"}
@@ -1025,6 +1109,10 @@ def _fetch_google_jobs(career_url: str) -> list:
                     continue
                 seen_ids.add(job_id)
                 new_this_page += 1
+                company = (str(job[7]).strip()
+                           if len(job) > 7 and isinstance(job[7], str) else "")
+                if wanted and company and company.lower() not in wanted:
+                    continue  # BUG-83: other hiring company on the shared board
                 slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
                 url  = (f"https://www.google.com/about/careers/applications/"
                         f"jobs/results/{job_id}-{slug}")
@@ -1035,7 +1123,7 @@ def _fetch_google_jobs(career_url: str) -> list:
                 ts = job[12]
                 if isinstance(ts, list) and ts and isinstance(ts[0], (int, float)):
                     posted = datetime.fromtimestamp(ts[0]).strftime("%Y-%m-%d")
-                md_parts = [f"# {title}", "**Company:** Google",
+                md_parts = [f"# {title}", f"**Company:** {company or 'Google'}",
                             f"**Location:** {location}"]
                 for label, idx in (("Minimum Qualifications", 4),
                                    ("Preferred Qualifications", 19),
@@ -1068,16 +1156,142 @@ def _fetch_google_jobs(career_url: str) -> list:
     return results
 
 
+_MS_PLACEHOLDER_LOC = {"multiple locations", "other", "various"}
+
+
+def _format_microsoft_location(locations) -> str:
+    """Reorder Eightfold's "Country, State, City" strings to the
+    "City, State, Country" shape every other adapter (and classify_region)
+    uses; drop placeholder tokens ("Multiple Locations"). A segment that is
+    only a country after that is dropped too, so a placeholder-only posting
+    yields "" — the conservative Unknown → keep path, never an Other drop.
+    Multiple postings locations join with "; "."""
+    segs: list[str] = []
+    for raw in (locations or []):
+        tokens = [t.strip() for t in str(raw or "").split(",")]
+        tokens = [t for t in tokens if t and t.lower() not in _MS_PLACEHOLDER_LOC]
+        if len(tokens) < 2:
+            continue
+        seg = ", ".join(reversed(tokens))
+        if seg not in segs:
+            segs.append(seg)
+    return "; ".join(segs)
+
+
+# pcsx is burst-rate-limited (HTTP 429 after a few rapid calls; 2 s pacing
+# walked 12+ pages clean, 1 s did not — measured live 2026-08-22). Pace
+# between pages and, on a 429 that survives the generic retry, back off and
+# re-request the SAME page a few times before giving up. Tests patch to 0.
+_MS_PAGE_SLEEP_SECS = 2.0
+_MS_429_BACKOFF_SECS = 15.0
+_MS_429_MAX_RETRIES = 3
+
+
+def _fetch_microsoft_jobs(career_url: str) -> list:
+    """2026-08-22 (REQ-169): fetch TPM jobs from Microsoft's Eightfold-hosted
+    careers site via its public search API:
+
+        GET https://apply.careers.microsoft.com/api/pcsx/search
+            ?domain=microsoft.com&query=<q>&location=United States&start=N&num=10
+
+    Verified live 2026-08-22: `domain` is required (422 otherwise), `num` is
+    capped at 10 per page, `data.count` carries the total (528 for the US TPM
+    query), `postedTs`/`creationTs` are epoch seconds, `positionUrl` is
+    `/careers/job/{id}`, `locations` are "Country, State, City" strings. The
+    legacy gcsservices.careers.microsoft.com endpoint fails TLS name
+    verification and the Eightfold `/api/apply/v2/jobs` route answers
+    "Not authorized for PCSX" — pcsx/search is the one the SPA itself calls.
+
+    Query deliberately narrow AND quoted (Microsoft is Mid-large Tech —
+    generic PM titles out of scope; same rationale as Amazon/Google): the
+    quoted phrase returns ~49 postings in 5 pages and — verified by id-set
+    comparison 2026-08-22 — exactly the same 37 TPM-titled postings as the
+    unquoted fuzzy search's 527 rows / 53 pages (which only add "Program
+    Manager" noise that _tpm_filter drops anyway, at 10× the rate-limit
+    exposure). No JD prefetch: the JD comes from the job page's JSON-LD in
+    _scrape_microsoft_jd. Same undocumented-API risk class as Workday/Ashby
+    (R-09); failure returns [] and the crawler path takes over as before."""
+    # sort_by=timestamp: the default relevance order is NOT stable across
+    # pages (a 120-row walk returned 110 unique ids — ~12% of postings
+    # silently missed); timestamp order is stable (120/120). Relevance is
+    # irrelevant here because the whole result set is walked and
+    # _tpm_filter restores precision client-side.
+    _BASE = ("https://apply.careers.microsoft.com/api/pcsx/search"
+             "?domain=microsoft.com&query=%22technical%20program%20manager%22"
+             "&location=United%20States&sort_by=timestamp")
+    _HEADERS = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Referer": "https://apply.careers.microsoft.com/careers"}
+    _PAGE, _MAX_PAGES = 10, 150  # runaway guard: 1,500 postings
+    results, start, count, throttled = [], 0, None, 0
+    seen_ids: set[str] = set()  # belt-and-braces against page-boundary repeats
+    for page in range(_MAX_PAGES):
+        logging.info(f"[Microsoft API] GET start={start}")
+        r = _http_request_with_retry("GET", f"{_BASE}&start={start}&num={_PAGE}",
+                                     timeout=15, headers=_HEADERS)
+        if r is None:
+            break
+        if r.status_code == 429 and throttled < _MS_429_MAX_RETRIES:
+            throttled += 1
+            logging.warning(f"[Microsoft API] 429 at start={start} — backing off "
+                            f"{_MS_429_BACKOFF_SECS:.0f}s (retry {throttled}/{_MS_429_MAX_RETRIES})")
+            if _MS_429_BACKOFF_SECS:
+                time.sleep(_MS_429_BACKOFF_SECS)
+            continue  # same `start` — the page is re-requested
+        if r.status_code != 200:
+            logging.warning(f"[Microsoft API] {r.status_code} at start={start}")
+            break
+        throttled = 0
+        try:
+            data      = (r.json() or {}).get("data") or {}
+            positions = data.get("positions") or []
+            if count is None and isinstance(data.get("count"), int) and data["count"] > 0:
+                count = data["count"]
+        except (ValueError, KeyError, TypeError, AttributeError) as e:
+            logging.error(f"[Microsoft API] parse error: {type(e).__name__}: {e}")
+            break
+        for p in positions:
+            pid   = str(p.get("id") or "").strip()
+            title = (p.get("name") or "").strip()
+            if not pid or not title or pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            path = (p.get("positionUrl") or f"/careers/job/{pid}").strip()
+            url  = path if path.startswith("http") else \
+                   f"https://apply.careers.microsoft.com{path}"
+            ts = p.get("postedTs") or p.get("creationTs")
+            posted = (datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+                      if isinstance(ts, (int, float)) and ts > 0 else "")
+            results.append({"url": url, "title": title,
+                            "location": _format_microsoft_location(p.get("locations")),
+                            "posted_date": posted})
+        start += _PAGE
+        if len(positions) < _PAGE:
+            break
+        if isinstance(count, int) and start >= count:
+            break
+        if _MS_PAGE_SLEEP_SECS:
+            time.sleep(_MS_PAGE_SLEEP_SECS)
+    else:
+        logging.error(f"[Microsoft API] hit {_MAX_PAGES}-page runaway guard — "
+                      "response likely corrupt")
+    logging.info(f"[Microsoft API] {len(results)} postings total")
+    return results
+
+
 # ── Job discovery helpers (routing table lookup) ─────────────────────────────
 def _resolve_list_fn(fn_name: str):
     """Resolve a list_fn name string to the actual callable."""
     return {
-        "_fetch_ats_jobs":      _fetch_ats_jobs,
-        "_fetch_ashby_jobs":    _fetch_ashby_jobs,
-        "_fetch_workable_jobs": _fetch_workable_jobs,
-        "_fetch_workday_jobs":  _fetch_workday_jobs,
-        "_fetch_amazon_jobs":   _fetch_amazon_jobs,
-        "_fetch_google_jobs":   _fetch_google_jobs,
+        "_fetch_ats_jobs":       _fetch_ats_jobs,
+        "_fetch_ashby_jobs":     _fetch_ashby_jobs,
+        "_fetch_workable_jobs":  _fetch_workable_jobs,
+        "_fetch_workday_jobs":   _fetch_workday_jobs,
+        "_fetch_amazon_jobs":    _fetch_amazon_jobs,
+        "_fetch_google_jobs":    _fetch_google_jobs,
+        "_fetch_microsoft_jobs": _fetch_microsoft_jobs,
     }[fn_name]
 
 
@@ -1262,9 +1476,19 @@ def _parse_jsonld_jobposting(html: str) -> dict:
     )
 
     def _fmt_addr(addr: dict) -> str:
-        parts = [addr.get("addressLocality", ""),
-                 addr.get("addressRegion", ""),
-                 addr.get("addressCountry", "")]
+        # BUG-85: schema.org allows addressCountry (and addressRegion) to be a
+        # nested {"@type": "Country", "name": "US"} object — Eightfold
+        # (Microsoft) emits exactly that; str.join on a dict raised TypeError
+        # and silently disabled the whole JSON-LD path for those pages.
+        def _s(v) -> str:
+            if isinstance(v, dict):
+                v = v.get("name") or v.get("addressCountry") or ""
+            return str(v or "").strip()
+        if not isinstance(addr, dict):
+            return ""
+        parts = [_s(addr.get("addressLocality")),
+                 _s(addr.get("addressRegion")),
+                 _s(addr.get("addressCountry"))]
         return ", ".join(p for p in parts if p)
 
     for block in blocks:
@@ -1409,25 +1633,13 @@ def _scrape_microsoft_jd(url: str) -> str:
     "Other open roles" content (audit Line 2 — ~40-50% of MS cached JDs were
     nav-chrome rather than JD bodies).
 
-    Mirrors _scrape_google_jd: Firecrawl with only_main_content=True is
-    primary; falls back to plain requests + JSON-LD if Firecrawl is
-    unavailable (Microsoft typically does not embed JSON-LD, so the fallback
-    will usually return "" — that's fine, the generic browser scraper picks
-    up downstream).
+    2026-08-22 (REQ-169): Microsoft careers now runs on Eightfold
+    (apply.careers.microsoft.com) whose job pages embed a JobPosting JSON-LD
+    with the full description + datePosted. That plain GET is tried FIRST
+    (free, deterministic, also feeds the BUG-67 date stash); Firecrawl with
+    only_main_content=True stays as the fallback for pages without JSON-LD;
+    "" on both → the generic browser scraper picks up downstream.
     """
-    if _FC_POOL is not None and not _FC_POOL.exhausted:
-        try:
-            result = _FC_POOL.scrape(url, formats=["markdown"], only_main_content=True)
-            md = getattr(result, "markdown", None) or (
-                result.get("markdown", "") if isinstance(result, dict) else "")
-            if md and len(md) > 200:
-                logging.info(f"[Microsoft JD] Firecrawl fetched: {url}")
-                return md[:8000]
-        except Exception as e:
-            logging.debug(f"[Microsoft JD] Firecrawl failed: {e}")
-
-    # Future-proof JSON-LD fallback (Microsoft doesn't currently embed one,
-    # but if they ever add it we'll pick it up automatically).
     _headers = {
         "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -1445,6 +1657,17 @@ def _scrape_microsoft_jd(url: str) -> str:
                 return text
     except Exception as e:
         logging.debug(f"[Microsoft JD] requests failed: {e}")
+
+    if _FC_POOL is not None and not _FC_POOL.exhausted:
+        try:
+            result = _FC_POOL.scrape(url, formats=["markdown"], only_main_content=True)
+            md = getattr(result, "markdown", None) or (
+                result.get("markdown", "") if isinstance(result, dict) else "")
+            if md and len(md) > 200:
+                logging.info(f"[Microsoft JD] Firecrawl fetched: {url}")
+                return md[:8000]
+        except Exception as e:
+            logging.debug(f"[Microsoft JD] Firecrawl failed: {e}")
 
     return ""
 
@@ -1964,23 +2187,41 @@ def _assess_jd_quality(jd_data: dict) -> str:
     return "partial"
 
 
+def _first_seen_max_age_days(track: str = "") -> int:
+    """REQ-170: first-seen window per track class — vertical tracks get the
+    longer window (see shared/config.py); Mid-large Tech / blank / custom
+    values keep the PRJ-004 14-day window."""
+    if (track or "").strip() in VERTICAL_TRACKS:
+        return FIRST_SEEN_MAX_AGE_DAYS_VERTICAL
+    return FIRST_SEEN_MAX_AGE_DAYS
+
+
 def _apply_prescrape_freshness_gate(to_process: list, list_meta: dict,
-                                    known_url_meta: dict) -> tuple:
-    """PRJ-004 REQ-004-10 (D-11/D-18): pre-scrape freshness gate.
+                                    known_url_meta: dict, track: str = "") -> tuple:
+    """PRJ-004 REQ-004-10 (D-11/D-18) + REQ-170: pre-scrape freshness gate.
 
     Skips a URL iff ALL of: it is NOT already in the sheet, the list API
-    supplied a date that PARSES as ISO (YYYY-MM-DD), and that date is ≥15 days
-    old. Unparseable/blank dates are explicitly NOT treated as aged — they take
-    the unknown-date keep+flag path (never a silent drop), so a future adapter
-    forwarding raw date text cannot cause aged-drops. Rows already tracked are
-    never retroactively touched. Returns (kept_urls, aged_skipped_count)."""
+    supplied a date that PARSES as a real ISO calendar date (YYYY-MM-DD), and
+    that date is older than the track's first-seen window
+    (`_first_seen_max_age_days`: 14 days Mid-large Tech / blank, 45 days on
+    vertical tracks). Unparseable/blank/invalid dates are explicitly NOT
+    treated as aged — they take the unknown-date keep+flag path (never a
+    silent drop), so a future adapter forwarding raw date text cannot cause
+    aged-drops. Rows already tracked are never retroactively touched.
+    Returns (kept_urls, aged_skipped_count)."""
     kept, aged_skipped = [], 0
+    max_age = _first_seen_max_age_days(track)
+    today = datetime.now().date()
     for u in to_process:
         posted = str((list_meta.get(u) or {}).get("posted_date", "") or "").strip()
-        is_parseable_date = bool(re.match(r"^\d{4}-\d{2}-\d{2}$", posted))
-        if u not in known_url_meta and is_parseable_date \
-                and compute_freshness_tier(posted) is None:
-            logging.info(f"[FreshnessGate] Skipped ≥15-day-old posting "
+        age = None
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", posted):
+            try:
+                age = (today - datetime.strptime(posted, "%Y-%m-%d").date()).days
+            except ValueError:
+                age = None  # "2026-13-45" → unknown date, keep + flag
+        if u not in known_url_meta and age is not None and age > max_age:
+            logging.info(f"[FreshnessGate] Skipped posting older than {max_age} days "
                          f"({posted}): {u}")
             aged_skipped += 1
             continue
@@ -2227,9 +2468,10 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
                   f"user-triaged posting(s).")
 
     to_process, aged_skipped = _apply_prescrape_freshness_gate(
-        to_process, list_meta, known_url_meta)
+        to_process, list_meta, known_url_meta, track)
     if aged_skipped:
-        print(f"    🕰️  Freshness gate: skipped {aged_skipped} posting(s) ≥15 days old.")
+        print(f"    🕰️  Freshness gate: skipped {aged_skipped} first-seen posting(s) "
+              f"older than {_first_seen_max_age_days(track)} days.")
 
     if not to_process:
         print(f"    All {len(urls)} JDs fresh (< {FRESH_DAYS} days) or aged out. Skipping.")

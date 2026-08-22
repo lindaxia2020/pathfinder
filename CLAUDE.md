@@ -95,6 +95,15 @@ will enrich them on the next pipeline run:
   manually-inserted rows pass the same write-time gates as discovery
   (geo/domain/YoE/work-auth, BUG-66) — a non-US JD URL will be skipped.
 
+### Freshness first-seen window (REQ-170)
+
+A posting seen for the first time is skipped pre-scrape when its list-API
+date is older than the track's window — `FIRST_SEEN_MAX_AGE_DAYS = 14`
+(Mid-large Tech / blank) or `FIRST_SEEN_MAX_AGE_DAYS_VERTICAL = 45`
+(AI-native / Robotics / Fintech / Space / Defense) in `shared/config.py`.
+Rows already in JD_Tracker are never touched; kept rows older than 14 days
+have no freshness tier (sort tier 9, bottom). Change the constants to tune.
+
 ### User triage tabs (BUG-65)
 
 `JD_ToApply` and `Skipped JD` are user-owned tabs (same columns as

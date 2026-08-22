@@ -25,3 +25,27 @@ date, URL), add one assertion that the downstream deterministic gate
 And when a paginated fetch returns a round number (40, 100) for a large
 company, treat it as a cap until proven otherwise.
 
+
+## 2026-08-22 — A live adapter check must walk the whole result set, not page 1
+**What happened**: the new Microsoft `pcsx/search` adapter parsed page 1
+perfectly in unit tests and live, but the first full live run returned 30 of
+528 postings: the API is burst-rate-limited, the generic HTTP retry's 0.5 s
+back-off was too short, and the loop treated the surviving 429 as "done".
+A round, suspiciously small total looked like a plausible result again
+(same shape as the Workday 40-cap on 2026-08-20).
+**Rule**: for every new list adapter, run one full live walk and compare the
+fetched count against the API's own total (`count` / `total` / `hits`)
+before calling it done; when they differ, look for rate limiting first.
+Make 429 handling explicit per adapter (pace + same-page retry), and keep
+the verification script output in the task notes.
+
+## 2026-08-22 — Broad `except` around a parser hides its bugs; assert on a live sample
+**What happened**: `_parse_jsonld_jobposting` crashed on a perfectly valid
+schema.org `addressCountry: {"@type": "Country", "name": "US"}` (TypeError in
+`", ".join`). Every caller wraps the parse in `except Exception`, so the path
+silently fell through to Firecrawl/browser and nobody noticed the JSON-LD
+route was dead for those pages.
+**Rule**: when a parser sits behind a broad `except`, keep one test that
+feeds it a verbatim live sample and asserts the parsed fields (not just
+"no exception"), and log at WARNING (not DEBUG) when a structured path that
+"should" work returns nothing.
