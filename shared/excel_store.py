@@ -50,7 +50,10 @@ def load_workbook_readonly(xlsx_path: str):
 # ── Sheet headers ─────────────────────────────────────────────────────────────
 # PRJ-004 (D-09/D-15): "AI Domain" → "Track" (6-bucket taxonomy), "AI TPM Jobs"
 # → "Qualified Jobs" (count of domain-qualified rows across all 5 tracks).
-COMPANY_HEADERS          = ["Company Name", "Track", "Business Focus", "Career URL", "Updated At", "TPM Jobs", "Qualified Jobs", "No TPM Count", "Auto Archived"]
+# Columns of the removed auto-archive feature (REQ-063, retired 2026-08-21);
+# stripped from existing workbooks by the Company_List migration.
+_LEGACY_ARCHIVE_COLUMNS = frozenset({"No TPM Count", "Auto Archived"})
+COMPANY_HEADERS          = ["Company Name", "Track", "Business Focus", "Career URL", "Updated At", "TPM Jobs", "Qualified Jobs"]
 WITHOUT_TPM_HEADERS      = ["Company Name", "Track", "Business Focus", "Career URL", "Updated At", "TPM Jobs", "Qualified Jobs"]
 # PRJ-004 REQ-004-14: every JD row is domain-qualified at write time, so the
 # boolean "Is AI TPM" becomes the 5-value "Job Domain". "Location Tier" becomes
@@ -183,15 +186,20 @@ def get_or_create_excel(xlsx_path: str = EXCEL_PATH) -> str:
                     changed = True
                     import logging as _log
                     _log.info("[Excel] Migrated Company_List: added 'TPM Jobs' and 'Qualified Jobs' columns.")
-                # REQ-063: add "No TPM Count" and "Auto Archived" columns if missing
+                # 2026-08-21: auto-archive feature removed (was REQ-063) —
+                # drop its legacy "No TPM Count" / "Auto Archived" columns
+                # from existing workbooks (highest index first so positions
+                # of the remaining columns are unaffected).
                 co_headers = [ws_co.cell(1, c).value for c in range(1, ws_co.max_column + 1)]
-                if "No TPM Count" not in co_headers:
-                    next_col = ws_co.max_column + 1
-                    ws_co.cell(1, next_col).value = "No TPM Count"
-                    ws_co.cell(1, next_col + 1).value = "Auto Archived"
+                legacy_idx = sorted((i + 1 for i, h in enumerate(co_headers)
+                                     if h in _LEGACY_ARCHIVE_COLUMNS), reverse=True)
+                for idx in legacy_idx:
+                    ws_co.delete_cols(idx)
+                if legacy_idx:
                     changed = True
                     import logging as _log
-                    _log.info("[Excel] Migrated Company_List: added 'No TPM Count' and 'Auto Archived' columns.")
+                    _log.info("[Excel] Migrated Company_List: removed legacy "
+                              "'No TPM Count' / 'Auto Archived' columns.")
             # BUG-55: Migrate Company_Without_TPM: add "TPM Jobs" and "Qualified Jobs" if missing
             if "Company_Without_TPM" in wb.sheetnames:
                 ws_wt = wb["Company_Without_TPM"]
@@ -342,13 +350,12 @@ def upsert_companies(xlsx_path: str, companies_data: list):
     """Upsert companies into Company_List.
 
     For NEW companies: write all 9 columns with TPM counts initialized to
-    [0, 0, 0, "No"].
+    [0, 0].
     For EXISTING companies: only update cols 1–5 (Name, Track, Focus,
     Career URL, Updated At) — EXCEPT a filled Career URL, which is
     user-verified data and is never overwritten (REQ-153/BUG-75; only a
-    blank/N-A cell accepts a value). Cols 6–9 (TPM Jobs, Qualified Jobs,
-    No TPM Count, Auto Archived) are preserved — they are managed exclusively
-    by update_company_job_counts and the auto-archival pipeline.
+    blank/N-A cell accepts a value). Cols 6–7 (TPM Jobs, Qualified Jobs)
+    are preserved — they are managed exclusively by update_company_job_counts.
 
     Note: discovery dedup normally prevents existing names from reaching
     this function at all — the Career URL guard here is the storage-layer
@@ -371,7 +378,7 @@ def upsert_companies(xlsx_path: str, companies_data: list):
                             continue  # user-verified Career URL — never overwritten
                     ws.cell(idx[name], col, val)
             else:
-                ws.append(cols_1_to_5 + [0, 0, 0, "No"])
+                ws.append(cols_1_to_5 + [0, 0])
                 idx[name] = ws.max_row
         wb.save(xlsx_path)
     finally:
@@ -567,85 +574,6 @@ def sort_company_list_by_track(xlsx_path: str = EXCEL_PATH) -> int:
 
         wb.save(xlsx_path)
         return len(rows)
-    finally:
-        wb.close()
-
-
-# ── Archive helpers (REQ-063) ────────────────────────────────────────────────
-def get_archived_companies(xlsx_path: str = EXCEL_PATH) -> set:
-    """Return set of company names where Auto Archived == 'yes'."""
-    wb = load_workbook_readonly(xlsx_path)
-    try:
-        ws = wb["Company_List"]
-        headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-        arch_col = headers.get("Auto Archived")
-        if not arch_col:
-            return set()
-        names = set()
-        for r in range(2, ws.max_row + 1):
-            name = ws.cell(r, 1).value
-            archived = str(ws.cell(r, arch_col).value or "").strip().lower()
-            if name and archived == "yes":
-                names.add(str(name).strip())
-        return names
-    finally:
-        wb.close()
-
-
-def update_archive_status(xlsx_path: str, company_name: str,
-                          no_tpm_count: int, archived: str) -> None:
-    """Update No TPM Count and Auto Archived columns for a company."""
-    wb = load_workbook(xlsx_path)
-    try:
-        ws = wb["Company_List"]
-        headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-        cnt_col  = headers.get("No TPM Count")
-        arch_col = headers.get("Auto Archived")
-        if not cnt_col or not arch_col:
-            return
-        for r in range(2, ws.max_row + 1):
-            name = str(ws.cell(r, 1).value or "").strip()
-            if name == company_name:
-                ws.cell(r, cnt_col).value  = no_tpm_count
-                ws.cell(r, arch_col).value = archived
-                break
-        wb.save(xlsx_path)
-    finally:
-        wb.close()
-
-
-def unarchive_company(xlsx_path: str, company_name: str) -> None:
-    """Manually restore an archived company: reset counter and archived flag."""
-    update_archive_status(xlsx_path, company_name, 0, "no")
-
-
-def get_company_archive_info(xlsx_path: str = EXCEL_PATH) -> dict:
-    """Return {company_name: {"no_tpm_count": int, "archived": str}} for all companies.
-
-    BUG-73: single iter_rows pass — per-cell random access on a read-only
-    sheet re-parses the sheet XML from row 1 on every call (O(rows²)).
-    """
-    wb = load_workbook_readonly(xlsx_path)
-    try:
-        ws = wb["Company_List"]
-        rows = ws.iter_rows(values_only=True)
-        header = next(rows, None) or ()
-        cols = {h: i for i, h in enumerate(header)}
-        cnt_i  = cols.get("No TPM Count")
-        arch_i = cols.get("Auto Archived")
-        result = {}
-        if cnt_i is None or arch_i is None:
-            return result
-        for row in rows:
-            name = str((row[0] if row else None) or "").strip()
-            if not name:
-                continue
-            raw_cnt = row[cnt_i] if cnt_i < len(row) else None
-            cnt = int(raw_cnt) if isinstance(raw_cnt, (int, float)) and raw_cnt else 0
-            raw_arch = row[arch_i] if arch_i < len(row) else None
-            arch = str(raw_arch or "").strip().lower()
-            result[name] = {"no_tpm_count": cnt, "archived": arch}
-        return result
     finally:
         wb.close()
 
@@ -1039,34 +967,6 @@ def count_tpm_jobs_by_company(xlsx_path: str = EXCEL_PATH) -> dict:
         wb.close()
 
 
-def count_valid_tpm_jobs_by_company(xlsx_path: str = EXCEL_PATH) -> dict:
-    """Return {company_name: int} counting JD rows where data_quality != 'failed'.
-
-    Used by REQ-063 archive logic: only non-failed records count toward
-    determining whether a company has TPM jobs.
-    """
-    wb = load_workbook_readonly(xlsx_path)
-    try:
-        ws = wb["JD_Tracker"]
-        c_url = _JD_COL["JD URL"]
-        c_company = _JD_COL["Company"]
-        c_dq = _JD_COL["Data Quality"]
-        counts = {}
-        for r in range(2, ws.max_row + 1):
-            url     = ws.cell(r, c_url).value
-            company = str(ws.cell(r, c_company).value or "").strip()
-            if not url or company.lower() in ("", "n/a", "json error"):
-                continue
-            if c_dq:
-                dq = str(ws.cell(r, c_dq).value or "").strip().lower()
-                if dq == "failed":
-                    continue
-            counts[company] = counts.get(company, 0) + 1
-        return counts
-    finally:
-        wb.close()
-
-
 def update_company_job_counts(xlsx_path: str, counts: dict) -> None:
     """
     Write TPM Jobs / Qualified Jobs columns in Company_List.
@@ -1151,6 +1051,37 @@ _FL_CITY_HINTS = (
 # _WASHINGTON_STATE_FORMS.
 _WA_STATE_RE = re.compile(r",\s*wa\b")
 
+# BUG-79: full-state-name WA forms. ATS list APIs emit "City, Washington, USA"
+# (Amazon), "City, Washington, United States" (Microsoft) and "Greater Seattle
+# Area" (Ashby/Workday) — none carry a ", WA" token, so they classified
+# "Other" and the geo gate silently dropped them (177 of Amazon's 295 TPM
+# postings in one run). Rules, all D.C.-guarded by _DC_RE:
+#   * "<city>, washington[, <country>]" — the leading comma is what separates
+#     a state-qualified city from bare/ambiguous "Washington";
+#   * unambiguous Seattle-metro / WA city hints, vetoed when another
+#     state/province is named (Redmond, OR; Vancouver, BC).
+_WA_STATE_NAME_RE = re.compile(r",\s*washington(?:\s+state)?\s*(?:,|$)")
+_DC_RE = re.compile(r"\bd\.?c\b|district of columbia")
+_WA_CITY_HINTS = (
+    "greater seattle", "seattle", "bellevue", "redmond", "kirkland",
+    "bothell", "sammamish", "issaquah", "tacoma", "spokane",
+)
+_WA_CITY_VETO_RE = re.compile(r",\s*(or|oregon|bc|british columbia)\b|\bcanada\b")
+_CA_STATE_RE = re.compile(r",\s*ca\b")
+_TX_STATE_RE = re.compile(r",\s*tx\b")
+_FL_STATE_RE = re.compile(r",\s*fl\b")
+
+# BUG-82: Workday JSON-LD (Blue Origin) emits "<ST> - <building>, <country>"
+# ("WA - Landmark (Ride East), United States of America", "CA - Remote, …")
+# and remote postings arrive as "US - Remote" / "Remote (United States)" /
+# "Remote, US, East Coast". Segments are normalized first — "-", "–", "/",
+# "|" and parentheses become ", " — then a leading state code or a
+# "remote" token qualified by any US form is recognized.
+_SEG_SEP_RE = re.compile(r"\s*(?:[-–—/|()])\s*")
+_MULTI_COMMA_RE = re.compile(r"(?:\s*,\s*)+")
+_LEADING_STATE_RE = re.compile(r"^(wa|ca|tx|fl)(?:,|$)")
+_LEADING_STATE_MAP = {"wa": "WA", "ca": "CA", "tx": "TX", "fl": "FL"}
+
 # Sort-group precedence inside compute_sort_tier / best-region selection.
 _REGION_PRIORITY = {"WA": 0, "Remote": 1, "CA": 2, "TX": 3, "FL": 4,
                     "Other": 8, "Unknown": 9}
@@ -1214,6 +1145,12 @@ def classify_location(location: str) -> str:
 
 def _classify_region_segment(seg: str) -> str:
     """Classify one lowercase location segment → WA/Remote/CA/TX/FL/Other."""
+    # BUG-82: normalize separators so "WA - X (Y), USA" → "wa, x, y, usa" and
+    # "Remote (US)" → "remote, us" before any rule runs.
+    seg = _MULTI_COMMA_RE.sub(", ", _SEG_SEP_RE.sub(", ", seg)).strip(" ,")
+    lead = _LEADING_STATE_RE.match(seg)
+    if lead:
+        return _LEADING_STATE_MAP[lead.group(1)]
     # Whole WA state qualifies (2026-08-19 widening: Seattle metro → WA, so
     # Spokane/Vancouver/Olympia etc. are kept). Any ", WA" state token or an
     # explicitly state-qualified "Washington" form; bare "Washington" still
@@ -1222,18 +1159,27 @@ def _classify_region_segment(seg: str) -> str:
         return "WA"
     if seg in _WASHINGTON_STATE_FORMS:
         return "WA"
-    if seg == "remote":
-        return "Remote"
-    if seg.startswith("remote,"):
-        qualifier = seg[len("remote,"):].strip()
-        if qualifier in _US_REMOTE_QUALIFIERS:
+    # BUG-79: full-state-name / city-hint forms (see _WA_STATE_NAME_RE).
+    if not _DC_RE.search(seg):
+        if _WA_STATE_NAME_RE.search(seg):
+            return "WA"
+        if any(c in seg for c in _WA_CITY_HINTS) and not _WA_CITY_VETO_RE.search(seg):
+            return "WA"
+    tokens = [t.strip() for t in seg.split(",") if t.strip()]
+    if "remote" in tokens:
+        others = [t for t in tokens if t != "remote"]
+        # bare "Remote" (US-default) or remote + any US qualifier → Remote;
+        # remote + other tokens falls through to the state rules ("Remote,
+        # California" → CA) and otherwise ends Other ("Remote, Canada").
+        if not others or any(t in _US_REMOTE_QUALIFIERS for t in others):
             return "Remote"
-        return "Other"  # explicit non-US remote (e.g. "Remote, Canada")
-    if ", ca" in seg or "california" in seg or any(c in seg for c in _CA_CITY_HINTS):
+    # BUG-79: state tokens are word-bounded — the old substring test ", ca"
+    # also matched ", canada" (Toronto/Vancouver rows classified "CA").
+    if _CA_STATE_RE.search(seg) or "california" in seg or any(c in seg for c in _CA_CITY_HINTS):
         return "CA"
-    if ", tx" in seg or "texas" in seg or any(c in seg for c in _TX_CITY_HINTS):
+    if _TX_STATE_RE.search(seg) or "texas" in seg or any(c in seg for c in _TX_CITY_HINTS):
         return "TX"
-    if ", fl" in seg or "florida" in seg or any(c in seg for c in _FL_CITY_HINTS):
+    if _FL_STATE_RE.search(seg) or "florida" in seg or any(c in seg for c in _FL_CITY_HINTS):
         return "FL"
     return "Other"
 

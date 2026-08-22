@@ -34,15 +34,14 @@ from shared.excel_store import (
     get_jd_url_meta, get_triaged_jd_urls, canonical_jd_url, batch_update_jd_timestamps,
     get_jd_urls, upsert_jd_record, batch_upsert_jd_records,
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
-    get_archived_companies, get_company_archive_info, update_archive_status,
-    count_valid_tpm_jobs_by_company, sort_jd_tracker_by_tier,
+    sort_jd_tracker_by_tier,
     JOB_DOMAIN_VALUES, classify_region, compute_freshness_tier,
 )
 
 from shared.gemini_pool import _GeminiKeyPoolBase
 from shared.firecrawl_pool import build_pool_from_env
 from shared.rate_limiter import _RateLimiter
-from shared.config import MODEL, AUTO_ARCHIVE_THRESHOLD, JD_CACHE_DIR
+from shared.config import MODEL, JD_CACHE_DIR
 from shared.prompts import SECURITY_CLAUSE
 from shared.run_summary import RunSummary
 from shared.exceptions import GeminiTransientError
@@ -705,14 +704,21 @@ def _fetch_workday_jobs(career_url: str) -> list:
     Supports both standard (company.wd5.myworkdayjobs.com) and
     no-wd-prefix (company.myworkdayjobs.com) URL formats.
     """
-    m = re.match(r"https://([^.]+)(?:\.wd\d+)?\.myworkdayjobs\.com/([^/?#]+)", career_url)
+    m = re.match(r"https://([^.]+)(?:\.wd\d+)?\.myworkdayjobs\.com/([^?#]*)", career_url)
     if not m:
         logging.warning(f"[Workday] Cannot parse slug from {career_url}")
         return []
     company_slug = m.group(1)
-    site_slug    = m.group(2)
-    # Strip any sub-path (keep only the site name)
-    site_slug    = site_slug.split('/')[0]
+    path_segs    = [seg for seg in m.group(2).split('/') if seg]
+    # BUG-80: "/en-US/<site>" URLs carry a locale segment that is NOT part of
+    # the site slug — using it produced a CXS 404 (zero postings) for 13 of
+    # 28 Workday rows. Skip it; the site is the next path segment.
+    if path_segs and re.fullmatch(r"[a-z]{2}-[A-Z]{2}", path_segs[0]):
+        path_segs = path_segs[1:]
+    if not path_segs:
+        logging.warning(f"[Workday] Cannot parse site slug from {career_url}")
+        return []
+    site_slug    = path_segs[0]   # keep only the site name, drop sub-paths
 
     # Preserve the original host (with or without wd prefix)
     host_m = re.match(r"(https://[^/]+)", career_url)
@@ -727,6 +733,7 @@ def _fetch_workday_jobs(career_url: str) -> list:
     # HTTP 400 — 20 is the API's hard page-size cap, so we paginate at 20.
     _PAGE_SIZE, _MAX_PAGES = 20, 250
     results, offset = [], 0
+    total = None  # BUG-81: CXS reports `total` on page 0 only (0 afterwards)
     for page in range(_MAX_PAGES):
         # 2026-08-19 widening: search "Program Manager" (superset — also
         # surfaces Technical Project Manager and plain PM titles); precision
@@ -746,7 +753,11 @@ def _fetch_workday_jobs(career_url: str) -> list:
         try:
             data     = r.json()
             postings = data.get("jobPostings", [])
-            total    = data.get("total")
+            # BUG-81: only the first page carries the real total — later pages
+            # return total=0, which made `offset >= total` stop every Workday
+            # fetch at 40 postings (Salesforce: 422 matches, 40 examined).
+            if total is None and isinstance(data.get("total"), int) and data.get("total") > 0:
+                total = data.get("total")
         except (ValueError, KeyError, TypeError) as e:
             logging.error(f"[Workday API] parse error for {api_url}: {type(e).__name__}: {e}")
             break
@@ -2027,7 +2038,7 @@ def _fetch_jsonld_posted_date(url: str) -> str:
 
 
 def _gate_and_finalize(parsed: dict, track: str, url: str,
-                       posted_date: str = "") -> dict | None:
+                       posted_date: str = "", list_location: str = "") -> dict | None:
     """PRJ-004 write-time gates + record finalization (REQ-004-08/09/10/11).
 
     Returns the finalized record, or None when a gate skips the row. Runs on
@@ -2040,7 +2051,12 @@ def _gate_and_finalize(parsed: dict, track: str, url: str,
     # and are kept for review (they surface via Data Quality="partial");
     # only rows whose location confirmably matches no target region drop.
     loc = parsed.get("location", "")
-    if _geo_out_of_scope(loc, track):
+    # BUG-82: the list API's structured location (when present) already
+    # passed the pre-scrape geo gate; the LLM's verbatim/reformatted string is
+    # a second, differently-shaped reading of the same posting. Drop only
+    # when BOTH are out of scope — never on LLM formatting alone.
+    if _geo_out_of_scope(loc, track) and (
+            not list_location or _geo_out_of_scope(list_location, track)):
         print(f"      🌍 [GeoFilter] Skipped out-of-region ({loc}): {url}")
         return None
     # ── Gate 1 (REQ-004-09): domain. Vertical companies can't hit "None"
@@ -2058,12 +2074,13 @@ def _gate_and_finalize(parsed: dict, track: str, url: str,
     if _INTERN_TITLE_RE.search(parsed.get("job_title", "") or ""):
         print(f"      🚫 [InternGate] student role: {url}")
         return None
-    # ── Gate 2 (REQ-004-08): YoE — skip iff stated min ≤3 or ≥12
+    # ── Gate 2 (REQ-004-08, amended REQ-166 2026-08-21): YoE — skip iff
+    # stated min ≥11. No lower cut: a "2-5 yrs" startup TPM is in scope.
     # ("10+ years" keeps, "12+ years" skips). Unstated → keep + flag.
     min_yoe = parsed.get("min_yoe")
     if isinstance(min_yoe, int):
-        if min_yoe <= 3 or min_yoe >= 12:
-            print(f"      🚫 [YoEGate] stated min {min_yoe} yrs (skip rule: ≤3 or ≥12): {url}")
+        if min_yoe >= 11:
+            print(f"      🚫 [YoEGate] stated min {min_yoe} yrs (skip rule: ≥11): {url}")
             return None
         parsed["yoe_flag"] = ""
     else:
@@ -2104,6 +2121,7 @@ async def _process_scraped_jd(
     pending: list, timestamp_only: list,
     label: str,
     posted_date: str = "",
+    list_location: str = "",
 ) -> None:
     """Common pipeline: hash → stale check → cache → extract → gates → stage.
 
@@ -2133,7 +2151,8 @@ async def _process_scraped_jd(
                         f"staging JSON-ERROR audit row")
         pending.append((url, "EXTRACTION EMPTY — NOT JSON", hash_val))
         return
-    parsed = _gate_and_finalize(parsed, track, url, posted_date=posted_date)
+    parsed = _gate_and_finalize(parsed, track, url, posted_date=posted_date,
+                                list_location=list_location)
     if parsed is None:
         return
     jd_json = json.dumps(parsed)
@@ -2244,6 +2263,7 @@ async def process_company(row: list, known_url_meta: dict, xlsx_path: str,
             stale_set, known_url_meta,
             pending, timestamp_only, label,
             posted_date=(list_meta.get(url) or {}).get("posted_date", ""),
+            list_location=(list_meta.get(url) or {}).get("location", ""),
         )
 
     results = await asyncio.gather(*[fetch_one(u) for u in to_process], return_exceptions=True)
@@ -2357,16 +2377,6 @@ async def _main_inner(summary: RunSummary):
         summary.note("No companies in list")
         return
     summary.attempted = len(companies)
-
-    # REQ-063: skip auto-archived companies
-    archived_set = get_archived_companies(xlsx_path)
-    if archived_set:
-        before = len(companies)
-        companies = [r for r in companies if str(r[0]).strip() not in archived_set]
-        skipped = before - len(companies)
-        if skipped:
-            logging.info(f"[Archive] Skipped {skipped} auto-archived companies: "
-                         f"{sorted(archived_set)}")
 
     # Split by path for better concurrency control
     path_a = [r for r in companies if len(r) >= 4 and any(d in str(r[3]) for d in ALL_ATS)]
@@ -2492,31 +2502,6 @@ async def _main_inner(summary: RunSummary):
     for cname, v in sorted(counts.items(), key=lambda x: -x[1]["qualified"]):
         if v["tpm"] > 0:
             print(f"   {cname}: {v['tpm']} TPM | {v['qualified']} qualified")
-
-    # ── Phase: REQ-063 auto-archive companies with no TPM jobs ────────────────
-    print(f"\n{'='*60}")
-    print("🗄️  Updating archive status...")
-    valid_counts = count_valid_tpm_jobs_by_company(xlsx_path)
-    archive_info = get_company_archive_info(xlsx_path)
-    processed_names = {str(r[0]).strip() for r in companies if r[0]}
-    for cname in processed_names:
-        has_tpm = valid_counts.get(cname, 0) > 0
-        info = archive_info.get(cname, {"no_tpm_count": 0, "archived": ""})
-        if has_tpm:
-            # Reset counter if it was non-zero
-            if info["no_tpm_count"] > 0 or info["archived"] == "yes":
-                update_archive_status(xlsx_path, cname, 0, "no")
-                logging.info(f"[Archive] {cname}: TPM jobs found, reset counter.")
-        else:
-            new_count = info["no_tpm_count"] + 1
-            if new_count >= AUTO_ARCHIVE_THRESHOLD:
-                update_archive_status(xlsx_path, cname, new_count, "yes")
-                logging.info(f"[Archive] {cname}: auto-archived (no TPM jobs for "
-                             f"{new_count} consecutive runs).")
-            else:
-                update_archive_status(xlsx_path, cname, new_count, "no")
-                logging.info(f"[Archive] {cname}: no TPM jobs ({new_count}/"
-                             f"{AUTO_ARCHIVE_THRESHOLD}).")
 
     # ── Phase: Sort JD_Tracker by location tier ───────────────────────────────
     # Combined 1–6 sort tier: freshness primary, WA/Remote > CA/TX secondary.

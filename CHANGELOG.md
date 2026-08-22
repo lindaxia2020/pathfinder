@@ -1,5 +1,94 @@
 # CHANGELOG
 
+## 2026-08-21 (auto-archive feature removed — REQ-167)
+
+User decision: a company with no TPM openings today may publish one
+tomorrow, so the job agent must never skip a company. The REQ-063
+auto-archive mechanism is removed end-to-end:
+- `job_agent`: no `Auto Archived` skip list at run start; post-run archive
+  phase deleted.
+- `shared/excel_store.py`: `get_archived_companies` / `update_archive_status`
+  / `unarchive_company` / `get_company_archive_info` /
+  `count_valid_tpm_jobs_by_company` deleted; `COMPANY_HEADERS` back to 7
+  columns; the Company_List migration now **removes** legacy `No TPM Count`
+  / `Auto Archived` columns from existing workbooks (applied to
+  `pathfinder_dashboard.xlsx` on 2026-08-21; backup
+  `pathfinder_dashboard.backup-20260821.xlsx`).
+- `shared/config.py`: `AUTO_ARCHIVE_THRESHOLD` deleted.
+- Tests: REQ-063 classes replaced by `TestAutoArchiveRemoved` (headers,
+  helper absence, migration strips legacy columns, job_agent has no archive
+  references).
+
+## 2026-08-21 (write-time geo robustness BUG-82 + YoE policy REQ-166)
+
+Round 2 of the job-agent result review: discovery was fixed on 08-20, but
+two downstream write-time behaviours still hid rows the user expected.
+
+### Geo: leading state codes, remote variants, list-location fallback (BUG-82)
+
+- `classify_region` normalizes separators (`-`, `–`, `/`, `|`, parentheses →
+  `, `) before classifying, so Workday/Blue Origin `"WA - Landmark (Ride
+  East), United States of America"` → WA, `"CA - Remote, …"` → CA,
+  `"FL - The Factory at Rocket Park, …"` → FL. Leading state codes map
+  directly (`_LEADING_STATE_RE`).
+- Remote rule is token-based: bare "Remote" or remote + any US qualifier
+  (`US - Remote`, `Remote (United States)`, `Remote, US, East Coast`) →
+  Remote; remote + other tokens falls through to the state rules
+  (`Remote, California` → CA) and otherwise ends Other (`Remote, Canada`).
+- **Write-time gate**: `_gate_and_finalize` now also receives the list
+  API's structured location (`list_location`, threaded from
+  `process_company` → `_process_scraped_jd`). A row is dropped only when
+  both the LLM-extracted location and the list location are out of scope —
+  the LLM's formatting of a location the ATS already placed in scope can no
+  longer drop the row. Retry path (no list location) keeps its strictness.
+
+### YoE gate: skip only stated min ≥11 (REQ-166, amends REQ-004-08)
+
+The lower cut (min ≤3 → skip) is removed: a stated "2-5 years" TPM at an
+early-stage company (Cowboy Space, Greater Seattle Area) is in scope. Upper
+cut tightened from ≥12 to ≥11. Unstated-YoE handling (keep + flag /
+senior-title auto-qualify) unchanged.
+
+Tests: +3 (region variants, list-location rescue, YoE boundary table
+rewritten).
+
+## 2026-08-20 (job-agent recall fixes: WA geo forms + Workday slug/pagination)
+
+User review of a manual job_agent run — "Seattle big tech under-counted,
+Cowboy Space TPM missing" — root-caused to three silent-drop bugs
+(BUG-79~81). No filter-policy change; these restore recall the existing
+policy already intended.
+
+### Geo: full-state-name WA forms now classify "WA" (BUG-79)
+
+`classify_region` knew WA only via the `", WA"` token / exact whitelist, while
+CA/TX/FL had full-name + city hints. Amazon ("Seattle, Washington, USA" —
+177 of 295 TPM-titled postings), Microsoft ("Redmond, Washington, United
+States") and Ashby/Workday ("Greater Seattle Area") all classified "Other"
+and were dropped by both geo gates. Now:
+- `"<city>, Washington[, country]"` → WA (leading comma = state-qualified;
+  bare "Washington" still Other);
+- unambiguous WA city hints (greater seattle / seattle / bellevue / redmond /
+  kirkland / bothell / sammamish / issaquah / tacoma / spokane), vetoed when
+  another state/province is named (Redmond, OR; Vancouver, BC);
+- every WA name/hint rule is guarded by `_DC_RE` (dc / d.c. / district of
+  columbia) so D.C. forms — including "Capitol Hill, Washington, DC" — stay
+  Other.
+- Adjacent fix: CA/TX/FL state tokens are word-bounded regexes — the old
+  `", ca"` substring matched `", canada"` ("Toronto, Canada" → CA).
+
+### Workday: locale slug + pagination (BUG-80/81)
+
+- `/en-US/<site>` career URLs (13 of 28 Workday rows — Salesforce, Zillow,
+  Expedia, Walmart, Blue Origin, …) used "en-US" as the site slug → CXS 404 →
+  0 postings. The locale segment is now skipped.
+- The CXS API reports `total` on page 0 only (0 afterwards), so
+  `offset >= total` stopped every fetch at 40 postings. `total` is now
+  captured once from the first positive value; REQ-004-13 uncapped
+  pagination is live again (NVIDIA 40 → 725 postings; Blue Origin 0 → 295).
+
+Tests: +4 (region matrix extended; Workday locale + total-on-page-0).
+
 ## 2026-08-19 (filter widening: titles + WA geo)
 
 ### Title filter: Technical Project Manager everywhere; plain Program Manager on 4 vertical tracks

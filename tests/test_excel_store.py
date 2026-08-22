@@ -36,8 +36,6 @@ from shared.excel_store import (
     get_incomplete_jd_rows, count_tpm_jobs_by_company, update_company_job_counts,
     get_match_pairs, upsert_match_record, batch_upsert_match_records,
     get_scored_matches, get_tailored_match_pairs, batch_upsert_tailored_records,
-    get_archived_companies, update_archive_status, unarchive_company,
-    get_company_archive_info, count_valid_tpm_jobs_by_company,
     classify_location, sort_jd_tracker_by_tier, sort_company_list_by_track,
     get_triaged_jd_urls, TRIAGE_SHEETS, canonical_jd_url,
     get_incomplete_company_rows, update_company_business_focus,
@@ -254,11 +252,12 @@ class TestUpsertCompanies(unittest.TestCase):
 
 
 class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
-    """P0-5: upsert_companies must NOT reset cols 6-9 (TPM Jobs / AI TPM Jobs /
-    No TPM Count / Auto Archived) on existing rows. Those columns are managed
-    by update_company_job_counts and the auto-archival pipeline; resetting
-    them on upsert silently destroys data when the pipeline crashes between
-    company discovery and JD scraping."""
+    """P0-5: upsert_companies must NOT reset cols 6-7 (TPM Jobs / Qualified
+    Jobs) on existing rows. Those columns are managed by
+    update_company_job_counts; resetting them on upsert silently destroys
+    data when the pipeline crashes between company discovery and JD
+    scraping. (Cols 8-9 No TPM Count / Auto Archived retired 2026-08-21 with
+    the auto-archive feature.)"""
 
     def setUp(self):
         self.path = _tmp_xlsx()
@@ -268,8 +267,7 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
         if os.path.exists(self.path):
             os.remove(self.path)
 
-    def _seed_company_with_counts(self, name: str, tpm: int, ai_tpm: int,
-                                  no_tpm: int, auto_archived: str):
+    def _seed_company_with_counts(self, name: str, tpm: int, ai_tpm: int):
         upsert_companies(self.path, [{
             "company_name": name, "ai_domain": "NLP",
             "business_focus": "X", "career_url": "https://example.com/jobs"
@@ -281,8 +279,6 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
             if ws.cell(r, 1).value == name:
                 ws.cell(r, 6).value = tpm
                 ws.cell(r, 7).value = ai_tpm
-                ws.cell(r, 8).value = no_tpm
-                ws.cell(r, 9).value = auto_archived
                 break
         wb.save(self.path)
         wb.close()
@@ -293,14 +289,13 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
         try:
             for r in range(2, ws.max_row + 1):
                 if ws.cell(r, 1).value == name:
-                    return [ws.cell(r, c).value for c in range(1, 10)]
+                    return [ws.cell(r, c).value for c in range(1, 8)]
             return None
         finally:
             wb.close()
 
     def test_existing_row_preserves_tpm_counts(self):
-        self._seed_company_with_counts("Acme", tpm=5, ai_tpm=2,
-                                       no_tpm=1, auto_archived="Yes")
+        self._seed_company_with_counts("Acme", tpm=5, ai_tpm=2)
         # Re-upsert with NEW career_url
         upsert_companies(self.path, [{
             "company_name": "Acme", "ai_domain": "NLP",
@@ -312,8 +307,6 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
                          "filled career_url must be preserved (REQ-153)")
         self.assertEqual(row[5], 5, "TPM Jobs must be preserved")
         self.assertEqual(row[6], 2, "AI TPM Jobs must be preserved")
-        self.assertEqual(row[7], 1, "No TPM Count must be preserved")
-        self.assertEqual(row[8], "Yes", "Auto Archived must be preserved")
 
     def test_new_row_initializes_counts_to_zero(self):
         upsert_companies(self.path, [{
@@ -323,12 +316,10 @@ class TestP0_5UpsertCompaniesPreservesCounts(unittest.TestCase):
         row = self._read_row("NewCo")
         self.assertEqual(row[5], 0)
         self.assertEqual(row[6], 0)
-        self.assertEqual(row[7], 0)
-        self.assertEqual(row[8], "No")
+        self.assertEqual(len(row), 7, "Company_List has exactly 7 columns")
 
     def test_existing_row_updates_cols_1_to_5(self):
-        self._seed_company_with_counts("MutCo", tpm=9, ai_tpm=3,
-                                       no_tpm=0, auto_archived="No")
+        self._seed_company_with_counts("MutCo", tpm=9, ai_tpm=3)
         upsert_companies(self.path, [{
             "company_name": "MutCo", "track": "Robotics",
             "business_focus": "Updated focus",
@@ -2155,201 +2146,62 @@ class TestDataQualityColumn(unittest.TestCase):
         wb.close()
 
 
-class TestAutoArchive(unittest.TestCase):
-    """REQ-063: Auto-archive companies with no TPM jobs."""
+class TestAutoArchiveRemoved(unittest.TestCase):
+    """2026-08-21: the auto-archive feature (REQ-063) is removed — a company
+    with no TPM jobs today may post one tomorrow, so nothing is ever skipped.
+    Company_List carries no archive columns and existing workbooks lose the
+    legacy ones on open."""
 
     def setUp(self):
         self.path = _tmp_xlsx()
-        get_or_create_excel(self.path)
-        # Seed two companies
-        upsert_companies(self.path, [
-            {"company_name": "ArchiveCo", "ai_domain": "LLM",
-             "business_focus": "AI", "career_url": "https://archive.co/careers"},
-            {"company_name": "ActiveCo", "ai_domain": "Vision",
-             "business_focus": "AI", "career_url": "https://active.co/careers"},
-        ])
 
     def tearDown(self):
         if os.path.exists(self.path):
             os.remove(self.path)
 
-    def test_company_headers_include_archive_columns(self):
-        self.assertIn("No TPM Count", COMPANY_HEADERS)
-        self.assertIn("Auto Archived", COMPANY_HEADERS)
+    def test_company_headers_have_no_archive_columns(self):
+        self.assertNotIn("No TPM Count", COMPANY_HEADERS)
+        self.assertNotIn("Auto Archived", COMPANY_HEADERS)
+        self.assertEqual(COMPANY_HEADERS[-2:], ["TPM Jobs", "Qualified Jobs"])
 
-    def test_new_excel_has_archive_headers(self):
+    def test_archive_helpers_are_gone(self):
+        import shared.excel_store as es
+        for name in ("get_archived_companies", "update_archive_status",
+                     "unarchive_company", "get_company_archive_info",
+                     "count_valid_tpm_jobs_by_company"):
+            self.assertFalse(hasattr(es, name), name)
+        import shared.config as cfg
+        self.assertFalse(hasattr(cfg, "AUTO_ARCHIVE_THRESHOLD"))
+
+    def test_migration_strips_legacy_archive_columns(self):
+        # Build a pre-removal workbook: 9 Company_List columns with data.
+        get_or_create_excel(self.path)
+        wb = openpyxl.load_workbook(self.path)
+        ws = wb["Company_List"]
+        ws.cell(1, 8).value = "No TPM Count"
+        ws.cell(1, 9).value = "Auto Archived"
+        ws.append(["LegacyCo", "Space", "focus", "https://l.co/jobs",
+                   "2026-08-01 00:00:00", 4, 3, 2, "yes"])
+        wb.save(self.path); wb.close()
+        get_or_create_excel(self.path)  # migration runs here
         wb = openpyxl.load_workbook(self.path)
         ws = wb["Company_List"]
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        self.assertIn("No TPM Count", headers)
-        self.assertIn("Auto Archived", headers)
+        row = [ws.cell(2, c).value for c in range(1, ws.max_column + 1)]
         wb.close()
+        self.assertEqual(headers, COMPANY_HEADERS)
+        self.assertEqual(row, ["LegacyCo", "Space", "focus", "https://l.co/jobs",
+                               "2026-08-01 00:00:00", 4, 3])
 
-    def test_get_archived_companies_empty_initially(self):
-        result = get_archived_companies(self.path)
-        self.assertEqual(result, set())
-
-    def test_get_archived_companies_returns_archived(self):
-        update_archive_status(self.path, "ArchiveCo", 3, "yes")
-        result = get_archived_companies(self.path)
-        self.assertEqual(result, {"ArchiveCo"})
-
-    def test_get_archived_companies_excludes_non_archived(self):
-        update_archive_status(self.path, "ArchiveCo", 3, "yes")
-        update_archive_status(self.path, "ActiveCo", 1, "no")
-        result = get_archived_companies(self.path)
-        self.assertIn("ArchiveCo", result)
-        self.assertNotIn("ActiveCo", result)
-
-    def test_update_archive_status_writes_count_and_flag(self):
-        update_archive_status(self.path, "ArchiveCo", 2, "no")
-        wb = openpyxl.load_workbook(self.path)
-        ws = wb["Company_List"]
-        headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-        cnt_col = headers["No TPM Count"]
-        arch_col = headers["Auto Archived"]
-        for r in range(2, ws.max_row + 1):
-            if str(ws.cell(r, 1).value).strip() == "ArchiveCo":
-                self.assertEqual(ws.cell(r, cnt_col).value, 2)
-                self.assertEqual(ws.cell(r, arch_col).value, "no")
-                break
-        else:
-            self.fail("ArchiveCo not found in sheet")
-        wb.close()
-
-    def test_update_archive_status_sets_yes(self):
-        update_archive_status(self.path, "ArchiveCo", 3, "yes")
-        wb = openpyxl.load_workbook(self.path)
-        ws = wb["Company_List"]
-        headers = {ws.cell(1, c).value: c for c in range(1, ws.max_column + 1)}
-        arch_col = headers["Auto Archived"]
-        for r in range(2, ws.max_row + 1):
-            if str(ws.cell(r, 1).value).strip() == "ArchiveCo":
-                self.assertEqual(ws.cell(r, arch_col).value, "yes")
-                break
-        wb.close()
-
-    def test_unarchive_company_resets(self):
-        update_archive_status(self.path, "ArchiveCo", 3, "yes")
-        self.assertIn("ArchiveCo", get_archived_companies(self.path))
-        unarchive_company(self.path, "ArchiveCo")
-        self.assertNotIn("ArchiveCo", get_archived_companies(self.path))
-        info = get_company_archive_info(self.path)
-        self.assertEqual(info["ArchiveCo"]["no_tpm_count"], 0)
-        self.assertEqual(info["ArchiveCo"]["archived"], "no")
-
-    def test_get_company_archive_info_returns_all(self):
-        update_archive_status(self.path, "ArchiveCo", 3, "yes")
-        update_archive_status(self.path, "ActiveCo", 1, "no")
-        info = get_company_archive_info(self.path)
-        self.assertEqual(info["ArchiveCo"]["no_tpm_count"], 3)
-        self.assertEqual(info["ArchiveCo"]["archived"], "yes")
-        self.assertEqual(info["ActiveCo"]["no_tpm_count"], 1)
-        self.assertEqual(info["ActiveCo"]["archived"], "no")
-
-    def test_migration_adds_archive_columns(self):
-        """Old Excel without archive columns gets them via migration."""
+    def test_new_workbook_has_seven_company_columns(self):
+        get_or_create_excel(self.path)
         wb = openpyxl.load_workbook(self.path)
         ws = wb["Company_List"]
         headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        # Remove archive columns to simulate old file
-        for col_name in ("No TPM Count", "Auto Archived"):
-            if col_name in headers:
-                idx = headers.index(col_name) + 1
-                ws.delete_cols(idx)
-                headers = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-        wb.save(self.path)
         wb.close()
-        # Run migration
-        get_or_create_excel(self.path)
-        wb2 = openpyxl.load_workbook(self.path)
-        ws2 = wb2["Company_List"]
-        headers2 = [ws2.cell(1, c).value for c in range(1, ws2.max_column + 1)]
-        self.assertIn("No TPM Count", headers2)
-        self.assertIn("Auto Archived", headers2)
-        wb2.close()
-
-    def test_update_nonexistent_company_no_error(self):
-        """Updating a company that doesn't exist should not raise."""
-        update_archive_status(self.path, "GhostCo", 5, "yes")
-        # GhostCo not in sheet, so nothing should change
-        result = get_archived_companies(self.path)
-        self.assertNotIn("GhostCo", result)
+        self.assertEqual(headers, COMPANY_HEADERS)
 
 
-class TestCountValidTpmJobsByCompany(unittest.TestCase):
-    """REQ-063: count_valid_tpm_jobs_by_company excludes data_quality='failed'."""
-
-    def setUp(self):
-        self.path = _tmp_xlsx()
-        get_or_create_excel(self.path)
-
-    def tearDown(self):
-        if os.path.exists(self.path):
-            os.remove(self.path)
-
-    def test_empty_returns_empty(self):
-        result = count_valid_tpm_jobs_by_company(self.path)
-        self.assertEqual(result, {})
-
-    def test_counts_non_failed_records(self):
-        jd_ok = json.dumps({
-            "job_title": "TPM", "company": "TestCo", "location": "Remote",
-            "salary_range": "N/A", "requirements": ["Python"],
-            "additional_qualifications": [],
-            "key_responsibilities": ["Lead"], "is_ai_tpm": True,
-            "data_quality": "complete",
-        })
-        upsert_jd_record(self.path, "https://test.co/1", jd_ok, "h1")
-        result = count_valid_tpm_jobs_by_company(self.path)
-        self.assertEqual(result.get("TestCo"), 1)
-
-    def test_excludes_failed_records(self):
-        jd_ok = json.dumps({
-            "job_title": "TPM", "company": "TestCo", "location": "Remote",
-            "salary_range": "N/A", "requirements": ["Python"],
-            "additional_qualifications": [],
-            "key_responsibilities": ["Lead"], "is_ai_tpm": True,
-            "data_quality": "complete",
-        })
-        jd_fail = json.dumps({
-            "job_title": "TPM", "company": "TestCo", "location": "",
-            "salary_range": "N/A", "requirements": [],
-            "additional_qualifications": [],
-            "key_responsibilities": [], "is_ai_tpm": False,
-            "data_quality": "failed",
-        })
-        upsert_jd_record(self.path, "https://test.co/1", jd_ok, "h1")
-        upsert_jd_record(self.path, "https://test.co/2", jd_fail, "h2")
-        result = count_valid_tpm_jobs_by_company(self.path)
-        self.assertEqual(result.get("TestCo"), 1)
-
-    def test_company_only_failed_not_counted(self):
-        jd_fail = json.dumps({
-            "job_title": "TPM", "company": "FailCo", "location": "",
-            "salary_range": "N/A", "requirements": [],
-            "additional_qualifications": [],
-            "key_responsibilities": [], "is_ai_tpm": False,
-            "data_quality": "failed",
-        })
-        upsert_jd_record(self.path, "https://fail.co/1", jd_fail, "h1")
-        result = count_valid_tpm_jobs_by_company(self.path)
-        self.assertNotIn("FailCo", result)
-
-    def test_partial_quality_counted(self):
-        jd_partial = json.dumps({
-            "job_title": "TPM", "company": "PartCo", "location": "",
-            "salary_range": "N/A", "requirements": ["Python"],
-            "additional_qualifications": [],
-            "key_responsibilities": ["Lead"], "is_ai_tpm": True,
-            "data_quality": "partial",
-        })
-        upsert_jd_record(self.path, "https://part.co/1", jd_partial, "h1")
-        result = count_valid_tpm_jobs_by_company(self.path)
-        self.assertEqual(result.get("PartCo"), 1)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 class TestBug33NullListFields(unittest.TestCase):
     """BUG-33: d.get('requirements', []) returns None when Gemini returns null,
     causing TypeError in '\\n'.join(). Must handle null gracefully."""
@@ -2481,14 +2333,13 @@ class TestBug45UpsertCompaniesInitAllColumns(unittest.TestCase):
         upsert_companies(self.path, [{"company_name": "TestCo", "ai_domain": "NLP"}])
         wb = openpyxl.load_workbook(self.path)
         ws = wb["Company_List"]
-        # Row 2 should have 9 columns
-        vals = [ws.cell(2, c).value for c in range(1, 10)]
+        # Row 2 should have 7 columns (archive columns retired 2026-08-21)
+        vals = [ws.cell(2, c).value for c in range(1, 8)]
+        self.assertEqual(ws.max_column, 7)
         wb.close()
         self.assertEqual(vals[0], "TestCo")  # Company Name
         self.assertEqual(vals[5], 0)  # TPM Jobs
         self.assertEqual(vals[6], 0)  # AI TPM Jobs
-        self.assertEqual(vals[7], 0)  # No TPM Count
-        self.assertEqual(vals[8], "No")  # Auto Archived
 
 
 class TestBug46DocstringColumnNumber(unittest.TestCase):
@@ -2559,7 +2410,7 @@ class TestBug52JdTrackerDynamicColumns(unittest.TestCase):
         import inspect
         funcs = [get_jd_urls, get_jd_url_meta, batch_update_jd_timestamps,
                  get_jd_rows_for_match, get_incomplete_jd_rows,
-                 count_tpm_jobs_by_company, count_valid_tpm_jobs_by_company]
+                 count_tpm_jobs_by_company]
         import re
         pattern = re.compile(r'ws\.cell\(r,\s*\d+\)')
         for fn in funcs:
@@ -2886,11 +2737,63 @@ class TestClassifyRegion(unittest.TestCase):
         self.assertEqual(self._r("Washington, D.C."), "Other")
         # ", wa" substring must be a state token, not part of a word
         self.assertEqual(self._r("Cardiff, Wales"), "Other")
+        # BUG-79: D.C. forms with a neighbourhood/city prefix still → Other
+        self.assertEqual(self._r("Capitol Hill, Washington, DC"), "Other")
+        self.assertEqual(self._r("Washington, District of Columbia, United States"), "Other")
+        self.assertEqual(self._r("Washington, D.C., USA"), "Other")
+        # Redmond, OR / Vancouver, BC must not ride the WA city hints
+        self.assertEqual(self._r("Redmond, Oregon, USA"), "Other")
+        self.assertEqual(self._r("Vancouver, British Columbia, Canada"), "Other")
+        # BUG-79: ", ca" substring used to match ", canada"
+        self.assertEqual(self._r("Toronto, Canada"), "Other")
+        self.assertEqual(self._r("Toronto, ON, Canada"), "Other")
+
+    def test_wa_full_state_name_forms(self):
+        # BUG-79: full-state-name formats emitted by Amazon ("City, Washington,
+        # USA"), Microsoft ("City, Washington, United States"), Ashby/Workday
+        # ("Greater Seattle Area") were classified "Other" and silently dropped
+        # by the geo gate — the WA rule only knew the ", WA" token.
+        self.assertEqual(self._r("Seattle, Washington, USA"), "WA")
+        self.assertEqual(self._r("Redmond, Washington, USA"), "WA")
+        self.assertEqual(self._r("Bellevue, Washington, United States"), "WA")
+        self.assertEqual(self._r("Seattle, Washington"), "WA")
+        self.assertEqual(self._r("Greater Seattle Area"), "WA")
+        self.assertEqual(self._r("Seattle"), "WA")
+        self.assertEqual(self._r("Seattle, United States"), "WA")
+        self.assertEqual(self._r("Kirkland, Washington, US"), "WA")
+        # multi-location: WA still wins over CA
+        self.assertEqual(self._r("Culver City, California, USA; Seattle, Washington, USA"), "WA")
+        self.assertEqual(self._r("San Carlos, CA or Seattle, WA"), "WA")
 
     def test_remote(self):
         self.assertEqual(self._r("Remote"), "Remote")
         self.assertEqual(self._r("Remote, USA"), "Remote")
         self.assertEqual(self._r("Remote, Canada"), "Other")
+
+    def test_leading_state_code_and_separator_variants(self):
+        # BUG-82: Workday JSON-LD (Blue Origin) emits "<ST> - <building>,
+        # <country>"; Gemini sometimes keeps it verbatim → classified Other →
+        # geo-dropped at write time. Leading state codes and "-"/"/"/"()"
+        # separators are now normalized before classification.
+        self.assertEqual(self._r("WA - Landmark (Ride East), United States of America"), "WA")
+        self.assertEqual(self._r("WA - Centerpoint (Clarke East), United States of America"), "WA")
+        self.assertEqual(self._r("CA - Remote, United States of America"), "CA")
+        self.assertEqual(self._r("FL - The Factory at Rocket Park, United States of America"), "FL")
+        self.assertEqual(self._r("TX - Van Horn"), "TX")
+        self.assertEqual(self._r("Seattle/Bellevue, WA"), "WA")
+        self.assertEqual(self._r("Washington - USA"), "WA")
+        # remote separator variants
+        for loc in ("US - Remote", "Remote - US", "United States - Remote",
+                    "Remote (United States)", "Remote, US, East Coast",
+                    "US-Remote", "Remote / USA"):
+            self.assertEqual(self._r(loc), "Remote", loc)
+        # non-US remote and unrelated leading tokens stay Other
+        self.assertEqual(self._r("Remote - Canada"), "Other")
+        self.assertEqual(self._r("Remote (Canada)"), "Other")
+        self.assertEqual(self._r("Remote, Germany"), "Other")
+        self.assertEqual(self._r("Ca Mau, Vietnam"), "Other")
+        # remote + in-scope state: state rule still wins (CA remote is CA)
+        self.assertEqual(self._r("Remote, California"), "CA")
 
     def test_california_incl_socal(self):
         self.assertEqual(self._r("San Francisco, CA"), "CA")

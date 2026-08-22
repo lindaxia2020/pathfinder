@@ -10,3 +10,18 @@
 red suite — the pipe made the command's exit status `tail`'s (0), not pytest's.
 **Rule**: never chain `git commit` behind a piped pytest. Run pytest bare (or
 with `set -o pipefail`) and commit as a separate command after seeing the tally.
+
+## 2026-08-20 — Push real ATS location strings through the gate they feed
+**What happened**: `tests/test_job_agent.py` already used Amazon's real
+`normalized_location` format ("Seattle, Washington") as a fixture, but only
+asserted the adapter passed it through — nobody ran `classify_region` on it.
+The WA rule only knew ", WA", so 177 Amazon Washington TPM postings per run
+were silently geo-dropped from launch until the user noticed "Seattle big
+tech feels thin". Same pattern: the Workday CXS `total` quirk (page 0 only)
+capped every Workday company at 40 and looked like a plausible result count.
+**Rule**: when an adapter test carries a live-format fixture (location,
+date, URL), add one assertion that the downstream deterministic gate
+(`classify_region`, `compute_freshness_tier`, `_tpm_filter`) accepts it.
+And when a paginated fetch returns a round number (40, 100) for a large
+company, treat it as a cap until proven otherwise.
+

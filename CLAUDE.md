@@ -36,7 +36,7 @@ shared/              # Shared utilities reused across agents
   tavily_pool.py     # Tavily key rotation on 402/429/usage-limit + exhaustion raise (BUG-70)
   run_lock.py        # Cross-process run lock — one agent at a time (BUG-73); manual runs fail fast, pipeline queues via PATHFINDER_LOCK_WAIT=1
   rate_limiter.py    # Token-bucket rate limiter
-  config.py          # Shared constants (MODEL, AUTO_ARCHIVE_THRESHOLD)
+  config.py          # Shared constants (MODEL, TRACK_ORDER, JD_CACHE_DIR)
   prompts.py         # Shared LLM system prompts (RECRUITER, HM, TAILOR)
   schemas.py         # Pydantic response schemas for Gemini
   exceptions.py      # GeminiTransientError / GeminiStructuralError

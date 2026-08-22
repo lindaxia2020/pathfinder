@@ -86,7 +86,7 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 | REQ-028 | After each run, update TPM Jobs / AI TPM Jobs counts for each company in `Company_List` | `[x]` |
 | REQ-029 | Companies with no TPM jobs are written to the `Company_Without_TPM` sheet to avoid rediscovery on next run | `[x]` |
 
-> **Note (REQ-029)**: This is now automatically implemented by REQ-063. After `job_agent.py` finishes running, it automatically archives companies with consecutive runs showing no TPM jobs based on `No TPM Count` and `AUTO_ARCHIVE_THRESHOLD`. `excel_store.py` provides `update_archive_status()`/`unarchive_company()` and other management functions. The manual operation workflow has been replaced by automation.|
+> **Note (REQ-029)**: Superseded by REQ-063 (auto-archive) on 2026-03-16; REQ-063 itself was **removed on 2026-08-21 (REQ-167)** — companies are never skipped, since a company with no TPM jobs today may post one tomorrow. `Company_Without_TPM` remains a discovery-side record only.
 
 ---
 
@@ -189,10 +189,10 @@ PathFinder is an autonomous AI job discovery and matching system designed for TP
 | ID | Requirement Description | Priority | Status |
 |----|----------|--------|------|
 | REQ-062 | **ATS declarative routing table refactor**: Refactor the scattered if-elif ATS decision chains in `discover_jobs` and `_route_scraper` into a declarative routing configuration table (`ATS_ROUTING` dict). Each ATS platform corresponds to one configuration entry containing four fields: `domains` (URL matching domain list), `strategy` (`api` / `crawler`), `list_fn` (job listing retrieval function reference), `jd_fn` (JD detail extraction function reference). Adding a new ATS platform only requires adding one dictionary entry without modifying the decision chain. Retain a generic fallback entry as catch-all for unknown ATS platforms. The goal is to improve architecture extensibility **without changing any existing functional behavior**. | P3 | `[x]` |
-| REQ-063 | **Automatic archival of companies with no TPM jobs**: After `job_agent` completes scraping a company, if that company has had no TPM-related jobs in `JD_Tracker` for N consecutive runs (N is configurable, default 3), automatically mark that company's status in `Company_List` as `auto_archived`; subsequent runs skip that company to conserve API quota. Must support manual `unarchive` operation to re-include in scraping scope. Depends on REQ-060's `data_quality` field to ensure count reliability (only counting run records where `data_quality != 'failed'`). This requirement is the automated implementation of REQ-029 (handling companies with no TPM jobs), replacing the previous manual operation workflow. | P3 | `[x]` |
+| REQ-063 | ~~Automatic archival of companies with no TPM jobs~~ — **REMOVED 2026-08-21 (REQ-167)**. Was: after N=3 consecutive runs with no JD_Tracker rows, mark `Auto Archived = yes` and skip the company in later runs. Retired because it silently suppressed companies that later publish openings (and two bug-affected runs had pushed 334 companies to the brink of archival). Columns `No TPM Count` / `Auto Archived` are stripped from existing workbooks by the Company_List migration. | `[-]` |
 
 > **Code location (REQ-062)**: `agents/job_agent.py` — ATS classification constant section (`API_ATS` / `CRAWLER_ATS`), `discover_jobs()` function (routing logic), `_route_scraper()` function (crawler routing).
-> **Code location (REQ-063)**: `agents/job_agent.py` — post-run processing section (near `Company_Without_TPM` write), `shared/excel_store.py` — `Company_List` write logic (requires new `auto_archived` status support), `shared/config.py` — new `AUTO_ARCHIVE_THRESHOLD` (default 3) configuration constant.
+> **Code location (REQ-063)**: removed — see REQ-167 (`shared/excel_store.py` `_LEGACY_ARCHIVE_COLUMNS` migration is the only remaining trace).
 
 ---
 
@@ -318,7 +318,7 @@ decision log D-01…D-20 and risk register R-01…R-13).
 | ID | Requirement Description | Status |
 |----|----------|------|
 | REQ-004-01…06 | Company discovery: 6-bucket taxonomy (AI-native/Mid-large Tech/Robotics/Fintech/Space/Defense) at quotas 150/150/50/50/50/50; early-company rule (~2000+) on verticals; defense legacy-prime hard exclusion + Palantir allowlist (deterministic post-filter, not LLM-trusted); hires-in-region geography (Seattle/CA incl. SoCal/TX); one-time `--migrate-tracks` LLM re-bucketing with grandfathering (D-12), idempotent, audit table, `UNMIGRATED — manual review` flagging | `[t]` |
-| REQ-004-07…13 | Job filtering: permissive TPM title filter retained; YoE gate (skip stated min ≤3 or ≥12; unstated → keep + auto-qualify on Senior/Staff/Principal/Director title else manual-review flag); 5-track domain classifier with mid-large mapping anchors (D-10), vertical-track deterministic override; posting-date extraction (Greenhouse/Lever/Ashby/Workable/Workday/Amazon) + pre-scrape ≤14-day gate on parseable dates only (D-11/D-18, never retroactive, unparseable = unknown → keep+flag + optional Tavily backfill, D-19); global work-auth screen (citizenship/clearance → skip, `Work-Auth Status` audit); geo keep-set Seattle/CA/TX/US-Remote **(2026-08-19: titles widened per REQ-160, geo widened to WA-state per REQ-161)**; Workday pagination + Firecrawl uncap | `[t]` |
+| REQ-004-07…13 | Job filtering: permissive TPM title filter retained; YoE gate (skip stated min ≤3 or ≥12 — **amended by REQ-166 (2026-08-21): skip only stated min ≥11**; unstated → keep + auto-qualify on Senior/Staff/Principal/Director title else manual-review flag); 5-track domain classifier with mid-large mapping anchors (D-10), vertical-track deterministic override; posting-date extraction (Greenhouse/Lever/Ashby/Workable/Workday/Amazon) + pre-scrape ≤14-day gate on parseable dates only (D-11/D-18, never retroactive, unparseable = unknown → keep+flag + optional Tavily backfill, D-19); global work-auth screen (citizenship/clearance → skip, `Work-Auth Status` audit); geo keep-set Seattle/CA/TX/US-Remote **(2026-08-19: titles widened per REQ-160, geo widened to WA-state per REQ-161)**; Workday pagination + Firecrawl uncap | `[t]` |
 | REQ-004-14…16 | Excel: `Job Domain` replaces `Is AI TPM`; 6 new JD_Tracker columns; `Track`/`Qualified Jobs` renames (D-09/D-15); combined 1–6 `Sort Tier` (freshness primary, WA+Remote > CA/TX — region label "Seattle"→"WA" per REQ-161; 9 = unknown/aged/other sink) recomputed each sort; assert-empty legacy-schema guard; no auto-delete lifecycle preserved | `[t]` |
 | REQ-004-17…20 | Scrapers: Amazon.jobs JSON adapter with prefetched JD markdown (zero crawler fallback, G6b); LinkedIn search-signal-only policy; Tesla scraper regression-verified; Google Careers adapter — **implemented 2026-07-09 (T16) with a documented deviation**: design.md's `careers.google.com/api/v3/search/` endpoint is dead (404); `_fetch_google_jobs` instead parses the server-rendered results page's `AF_initDataCallback` payload (title/location/posted date/prefetched JD text, plain requests, defensive per-job parsing + href fallback) | `[t]` |
 | REQ-004-21…24 | Match layer: selector returns all valid rows with `job_domain`; 5 per-track Recruiter/HM prompt pairs + tailor emphasis from user-approved narratives (D-13); same-track byte-identity across match/optimizer (REQ-052 preserved per track); per-track context caches; batches never mix tracks | `[t]` |
@@ -381,7 +381,7 @@ last-writer-wins race on the workbook (BUG-73).
 | REQ-151 | Single-agent execution (BUG-73): at most one PathFinder agent process touches `pathfinder_dashboard.xlsx` at a time. Every agent entry point holds an exclusive `flock` (`shared/run_lock.py`, `logs/pathfinder.lock`) for its whole run. Default is fail-fast: a second launch aborts before any work or API spend, naming the holder (agent / pid / start time). `PATHFINDER_LOCK_WAIT=1` blocks until the lock frees instead — the scheduled pipeline (`run_pipeline_scheduled.sh`) exports it so phases queue rather than fail the daily run. Lock release is kernel-guaranteed on process exit (clean or crash); the lockfile's holder text is diagnostic only, never authoritative. | `[t]` |
 | REQ-152 | Crash-proof reads (BUG-73): every read-only workbook load goes through `load_workbook_readonly` — file bytes snapshotted to memory before parsing, so an external writer truncating the file mid-read (openpyxl `wb.save()` rewrites in place) can never kill a reader mid-stream. Catching a writer mid-save fails the zip open atomically and is retried (3 attempts, 0.5s apart) before raising. Defense-in-depth behind REQ-151 — also covers non-agent writers (e.g. Excel saving while the user has the dashboard open). | `[t]` |
 
-> **Code location**: `shared/run_lock.py`, `shared/excel_store.py` (`load_workbook_readonly`, `get_company_archive_info`), all four `agents/*` `__main__` blocks, `scripts/run_pipeline_scheduled.sh`.
+> **Code location**: `shared/run_lock.py`, `shared/excel_store.py` (`load_workbook_readonly`), all four `agents/*` `__main__` blocks, `scripts/run_pipeline_scheduled.sh`.
 
 ## 9.12 Company Career-URL/Track Quality & Staged Audit (2026-08-19)
 
@@ -413,6 +413,39 @@ Recall widening at the pre-scrape title/geo filter; write-time gates (domain
 | REQ-162 | Florida = Space-track-only target region: `classify_region` recognizes "FL" (`", fl"` token / "florida" / unambiguous Space-Coast city hints — bare "melbourne" excluded, Australia collision; precedence WA > Remote > CA > TX > FL; sort tier groups FL with CA/TX). The keep decision is track-aware via `job_agent._geo_out_of_scope(location, track)` — the single geo gate shared by `_tpm_filter` (pre-scrape) and `_gate_and_finalize` (write time): "FL" keeps only when Track == "Space", all other tracks treat FL like "Other". Company discovery: GEOGRAPHY extraction clause carries the matching Space-track FL exception. | `[t]` |
 
 > **Code location**: `agents/job_agent.py` (`TPM_KW`, `PM_TITLE_OK_TRACKS`, `_tpm_filter`, `llm_filter_jobs`, `_fetch_workday_jobs`, `_firecrawl_map`), `shared/excel_store.py` (`_WA_STATE_RE`, `_classify_region_segment`, `_REGION_PRIORITY`, `compute_sort_tier`).
+
+## 9.14 Job-Agent Recall Fixes (2026-08-20)
+
+User review of a manual job_agent run (Seattle big tech under-counted; Cowboy
+Space TPM missing). Bug fixes that restore recall the existing filter policy
+already intended — no policy change.
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-163 | WA geo forms (amends REQ-161, BUG-79): `classify_region` additionally returns "WA" for `"<city>, Washington[, <country>]"` (leading comma = state-qualified; bare "Washington" still Other) and for unambiguous WA city hints (`_WA_CITY_HINTS`: greater seattle / seattle / bellevue / redmond / kirkland / bothell / sammamish / issaquah / tacoma / spokane) unless another state/province is named (`_WA_CITY_VETO_RE`: OR / Oregon / BC / British Columbia / Canada). Every WA name/hint rule is D.C.-guarded (`_DC_RE`: dc / d.c. / district of columbia). CA/TX/FL state tokens are word-bounded regexes (`", ca"` no longer matches `", canada"`). Covers the Amazon ("City, Washington, USA"), Microsoft ("City, Washington, United States") and Ashby/Workday ("Greater Seattle Area") list-API formats. | `[t]` |
+| REQ-164 | Workday adapter correctness (amends REQ-004-13, BUG-80/81): `_fetch_workday_jobs` skips a leading `xx-XX` locale path segment when deriving the site slug (`/en-US/<site>` URLs), and captures the CXS `total` once from the first page reporting a positive value (later pages return `total: 0`) so pagination runs to the short page / runaway guard instead of stopping at 40 postings. | `[t]` |
+
+> **Code location**: `shared/excel_store.py` (`_WA_STATE_NAME_RE`, `_DC_RE`, `_WA_CITY_HINTS`, `_WA_CITY_VETO_RE`, `_CA_STATE_RE`/`_TX_STATE_RE`/`_FL_STATE_RE`, `_classify_region_segment`), `agents/job_agent.py` (`_fetch_workday_jobs`).
+
+## 9.15 Write-Time Geo Robustness & YoE Policy (2026-08-21)
+
+Round 2 of the job-agent result review (Cowboy Space / Blue Origin rows still
+absent after REQ-163/164).
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-165 | Geo robustness (amends REQ-161/163, BUG-82): (a) `classify_region` normalizes segment separators (`-`/`–`/`—`/`/`/`\|`/parentheses → `, `) before any rule; a leading state code (`WA,`/`CA,`/`TX,`/`FL,`) maps directly; the remote rule is token-based (bare "remote" or remote + any `_US_REMOTE_QUALIFIERS` token → Remote; remote + other tokens falls through to the state rules, otherwise Other). Covers Workday JSON-LD "<ST> - <building>, <country>" and `US - Remote` / `Remote (United States)` forms. (b) The write-time geo gate (`_gate_and_finalize`) receives the list-API structured location (`list_location`, threaded `process_company` → `_process_scraped_jd`) and drops a row only when BOTH the extracted and the list location are out of scope; the retry path passes no list location (unchanged strictness). | `[t]` |
+| REQ-166 | YoE gate policy (amends REQ-004-08): skip a JD only when its stated minimum YoE is **≥11**; no lower cut (stated "2-5 yrs" roles at early-stage companies are in scope). Unstated YoE keeps its keep+flag / senior-title auto-qualify handling. | `[t]` |
+
+> **Code location**: `shared/excel_store.py` (`_SEG_SEP_RE`, `_MULTI_COMMA_RE`, `_LEADING_STATE_RE`, `_classify_region_segment`), `agents/job_agent.py` (`_gate_and_finalize`, `_process_scraped_jd`, `process_company`).
+
+## 9.16 Auto-Archive Removal (2026-08-21)
+
+| ID | Requirement Description | Status |
+|----|----------|------|
+| REQ-167 | The auto-archive feature (REQ-063) is removed end-to-end: `job_agent` processes every Company_List row on every run (no skip list), the post-run archive phase and `AUTO_ARCHIVE_THRESHOLD` are gone, `Company_List` has exactly 7 columns (`COMPANY_HEADERS` ends at `Qualified Jobs`), and the `get_or_create_excel` migration deletes legacy `No TPM Count` / `Auto Archived` columns from existing workbooks (highest index first; remaining column positions unchanged). Rationale: a company with no TPM openings today may publish one tomorrow — never miss it. | `[t]` |
+
+> **Code location**: `agents/job_agent.py` (`_main_inner`), `shared/excel_store.py` (`COMPANY_HEADERS`, `_LEGACY_ARCHIVE_COLUMNS`, Company_List migration, `upsert_companies`), `shared/config.py`.
 
 ## 10. Technical Decision Record
 
@@ -463,3 +496,6 @@ Recall widening at the pre-scrape title/geo filter; write-time gates (domain
 | v2.4 | 2026-07-10 | Added "9.9 Company Agent Self-Heal & Full-Run Discovery": REQ-145 (discovery loop to 500 quota, supersedes single-batch REQ-004-01 behavior), REQ-146 (blank-Track enrichment via shared classifier), REQ-147 (Company_List Track sort as final step; `TRACK_ORDER` moved to `shared/config.py`), REQ-148 (Tavily key pool with usage-limit detection, BUG-70). Root cause of the 2026-07-09 zero-success run documented as Tavily plan-limit exhaustion (not code) — the "usage limit" error text additionally evaded all quota-abort checks, fixed by the pool. Tests: +27. |
 | v2.7 | 2026-08-19 | Added "9.12 Company Career-URL/Track Quality & Staged Audit": REQ-153 (filled Career URLs are user-verified — phase 1.5 write guard), REQ-154 (posting-URL + aggregator gates), REQ-155 (ATS board ownership verification, Workday matcher generalized), REQ-156 (report-only `--audit` → `Company_Audit` tab), REQ-157 (discovery confidence gate). Trigger: user's manual verification of all 380 Company_List rows (BUG-74~77). Tests: +~55 (1104 total). |
 | v2.6 | 2026-07-16 | Added "9.11 Concurrent-Run Safety": REQ-151 (exclusive per-run flock via `shared/run_lock.py`; manual runs fail fast, pipeline queues via `PATHFINDER_LOCK_WAIT=1`), REQ-152 (all read-only workbook loads snapshot to memory via `load_workbook_readonly` + retry). Root cause BUG-73: manual job_agent run overlapped the 6h-long 2026-07-16 scheduled pipeline — EOFError crash mid-read, duplicate scrape spend, write race. Tests: +9 (1042 total). |
+| v2.8 | 2026-08-20 | Added "9.14 Job-Agent Recall Fixes": REQ-163 (WA full-state-name / city-hint geo forms, D.C.-guarded; word-bounded CA/TX/FL state tokens — BUG-79), REQ-164 (Workday locale-slug skip + page-0-only `total` pagination — BUG-80/81). |
+| v2.9 | 2026-08-21 | Added "9.15 Write-Time Geo Robustness & YoE Policy": REQ-165 (separator normalization, leading state codes, token-based remote rule, list-location fallback at the write-time geo gate — BUG-82), REQ-166 (YoE gate skips only stated min ≥11; amends REQ-004-08). |
+| v2.10 | 2026-08-21 | Added "9.16 Auto-Archive Removal": REQ-167 — REQ-063 retired end-to-end (no company skip list, archive phase/threshold removed, Company_List back to 7 columns with a legacy-column-stripping migration); REQ-029 note updated. |

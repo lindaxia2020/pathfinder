@@ -1,16 +1,16 @@
 # Bug Tracker
 
-> Last updated: 2026-08-19 (BUG-74~78 company-agent career-URL/track quality — job-posting URLs stored as career URLs, unowned slug-probe boards, unguarded discovery track/focus, aggregator hosts, and the Tavily result path bypassing every identity check (BUG-78, caught by the first live `--suggest-urls` run). Fixed + `--audit`/`--suggest-urls`/`--apply-audit` correction loop; phase 1.5 no longer rewrites filled Career URLs)
+> Last updated: 2026-08-21 (BUG-82 leading-state-code / remote-variant location forms geo-dropped at write time; REQ-166 YoE gate now skips only stated min ≥11)
 
 ## Summary
 
 | Priority | Open | Fixed |
 |----------|------|-------|
 | P0 Critical | 0 | 7 (BUG-01~03, BUG-32~33, BUG-56, BUG-65) |
-| P1 High      | 0 | 21 (BUG-04~11, BUG-27~28, BUG-34~38, BUG-66~67, BUG-73~75, BUG-78) |
+| P1 High      | 0 | 25 (BUG-04~11, BUG-27~28, BUG-34~38, BUG-66~67, BUG-73~75, BUG-78~82) |
 | P2 Medium    | 0 | 30 (BUG-12~20, BUG-29~30, BUG-39~49, BUG-55, BUG-68~72, BUG-76~77) |
 | P3 Low       | 6 (BUG-57~61, BUG-63) | 14 (BUG-21~26, BUG-31, BUG-50~54, BUG-62, BUG-64) |
-| **Total** | **6** | **72** |
+| **Total** | **6** | **76** |
 
 ---
 
@@ -194,3 +194,31 @@
 | BUG-72 | `agents/job_agent.py` `_tpm_filter` / `_gate_and_finalize` | **Intern/co-op/new-grad postings reached JD_Tracker** (3 Tesla "Internship, Technical Program Manager, …" rows in the 2026-07 run). The YoE gate (REQ-004-08) can't catch them — intern JDs state no minimum YoE, so they fell into the keep+flag path. Fix: `_INTERN_TITLE_RE` (`\bintern(ship)?s?\b`, `co-op`, `new grad`; word-boundary — "Internal Tools" unaffected) dropped in `_tpm_filter` (pre-scrape, all ATS paths, saves scrape+Gemini cost) and as write-time Gate 1.5 in `_gate_and_finalize` (covers generic-crawler/LLM path + incomplete retries). | Fixed |
 | BUG-76 | `agents/company_agent.py` `CompanyInfo.confident` (new field); discovery system instruction; `run_company_audit` (new) | **Discovery-path Track/Business Focus guessing** (user audit: several of the 380 rows carried a wrong bucket or a description that fits a different company). The discovery Gemini pass was the ONLY company-writing path without a do-not-guess gate — the repair paths (`run_reenrich_business_focus`, `_TRACK_CLASSIFY_SYSTEM_INSTRUCTION`) both had one. Fix: `confident: bool` on `CompanyInfo` + "do not guess / empty business_focus when thin" instruction; unconfident extractions keep the row but blank Track/Focus (post-bucket-rules) so the confident-gated repair paths refill them next step/run. Plus the staged review flow: `python agents/company_agent.py --audit [--audit-limit N] [--audit-skip-http]` re-evaluates Track/Focus for every row (Gemini batches of 20, temperature 0, valid-names gate; ZERO Tavily) + URL health flags (POSTING_URL/AGGREGATOR/OWNERSHIP_MISMATCH/HTTP_FAIL/NON_ATS) into the transient `Company_Audit` tab (`replace_audit_sheet`, create-or-replace, never auto-created). REPORT-ONLY: never writes Company_List. Follow-up shipped 2026-08-19 (post user review): `--apply-audit` applies proposed Track/Focus cells, keyed by Company Name (not excel_row — sorts/deletions shift rows); Names + Career URLs never written; invalid buckets and deleted companies skipped; ends with the canonical Track sort. Deterministic taxonomy override retained: audit proposed PayPal→Fintech against the legacy-incumbent rule — reverted to Mid-large Tech at apply time. | Fixed |
 | BUG-77 | `agents/company_agent.py` `_AGGREGATOR_HOSTS` / `_is_aggregator_url` (new) | **Third-party aggregator/VC-board URLs accepted as career URLs** (user audit: builtin.com ×3, iitjobs.com, ycombinator.com, consider.com ×3, linkedin.com search URL — stale/multi-company listings that starve job_agent yield). `_is_likely_career_url` had no host blocklist and `_unwrap_career_url` only knew LinkedIn + 4 VC hosts. Fix: `_AGGREGATOR_HOSTS` blocklist (builtin/ycombinator/workatastartup/iitjobs/consider/wellfound/angel/indeed/glassdoor/ziprecruiter/simplyhired/otta/linkedin) with hostname-SUFFIX matching (never substring), rejected in `_is_likely_career_url` at discovery; rejection falls through to the remaining strategies (direct ATS probe with BUG-75 ownership gate, homepage) so the agent finds the company's own board or leaves blank-for-retry. `jobs.gem.com` deliberately NOT blocklisted (Gem is a real ATS; user-verified boards exist on it). Existing rows untouched — `--audit` flags them AGGREGATOR. | Fixed |
+
+---
+
+## 2026-08-20 Job-agent result review batch
+
+> User review of a manual job_agent run ("Seattle big tech under-represented; Cowboy Space TPM missing"). All three root-caused with live API probes; repro tests first, then fixes. Live post-fix: Amazon keeps 179 WA TPM postings (was 0), NVIDIA 40 → 725 postings fetched, Blue Origin 0 → 295 (17 WA TPM), Cowboy Space's Seattle TPM passes the geo gate.
+
+### P1 — High
+
+| # | File | Description | Status |
+|---|------|-------------|--------|
+| BUG-79 | `shared/excel_store.py` `_classify_region_segment`; `_WA_STATE_NAME_RE` / `_DC_RE` / `_WA_CITY_HINTS` / `_WA_CITY_VETO_RE` / `_CA_STATE_RE` / `_TX_STATE_RE` / `_FL_STATE_RE` (new) | **WA geo classifier only knew the `", WA"` token — every full-state-name location classified "Other" and was silently dropped by both geo gates.** Amazon's list API emits "Seattle, Washington, USA" (177 of its 295 TPM-titled postings, 34 fresh — all lost in the 2026-08-19 run; only CA/TX rows survived), Microsoft "Redmond, Washington, United States", Ashby/Workday "Greater Seattle Area" (Cowboy Space's 08-14 TPM, Blue Origin). CA/TX/FL had full-name + city hints since REQ-004-12; WA never did. Fix: `"<city>, Washington[, country]"` (leading comma distinguishes state-qualified from bare/D.C. "Washington"), unambiguous WA city hints ("greater seattle", "seattle", "bellevue", "redmond", "kirkland", "bothell", "sammamish", "issaquah", "tacoma", "spokane") vetoed when another state/province is named (Redmond, OR; Vancouver, BC), all guarded by `_DC_RE` (`dc` / `d.c.` / "district of columbia"). Found alongside: the `", ca"` **substring** test matched `", canada"` ("Toronto, Canada" → CA) — CA/TX/FL state tokens are now word-bounded regexes. Repro: `TestClassifyRegion.test_wa_full_state_name_forms` + extended `test_wa_no_false_positives`. | Fixed |
+| BUG-80 | `agents/job_agent.py` `_fetch_workday_jobs` slug parsing | **Workday `/en-US/<site>` URLs took the locale segment as the site slug → CXS endpoint 404 → zero postings** (fell through to the crawler, which yields nothing on Workday's SPA). 13 of 28 Workday rows affected: Salesforce, Zillow, Expedia, Walmart, Blue Origin, Autodesk, CrowdStrike, Bloomberg, Cadence, Circle, DataRobot, Darktrace, SailPoint. Fix: split the path, skip a leading `xx-XX` locale segment, site = next segment (job URLs built off the site, never the locale). Repro: `TestWorkdayPagination.test_locale_segment_skipped_in_api_path`. | Fixed |
+| BUG-81 | `agents/job_agent.py` `_fetch_workday_jobs` pagination | **Every Workday company capped at 40 postings.** The CXS API returns the real `total` on page 0 only and `total: 0` on every later page, so `offset >= total` fired after page 2 (Salesforce: 422 "Program Manager" matches, 40 examined; NVIDIA likewise 40). The REQ-004-13 "no artificial cap" pagination was therefore dead for 2+ page results since launch. Fix: capture `total` once from the first page that reports a positive value; short-page and runaway guards unchanged. Repro: `TestWorkdayPagination.test_total_only_on_first_page_does_not_stop_pagination`. | Fixed |
+
+---
+
+## 2026-08-21 Job-agent result review — round 2
+
+> After the BUG-79~81 re-run the user asked why Cowboy Space's 08-14 TPM and most Blue Origin WA TPMs were still absent. Reproduced scrape → extract → gate offline per JD: Cowboy Space was the YoE gate by design ("2-5 years" → min 2 ≤ 3 → skip; policy changed, REQ-166); Blue Origin rows were a write-time geo drop on LLM-formatted locations (BUG-82).
+
+### P1 — High
+
+| # | File | Description | Status |
+|---|------|-------------|--------|
+| BUG-82 | `shared/excel_store.py` `_classify_region_segment` (`_SEG_SEP_RE` / `_LEADING_STATE_RE` new; token-based remote rule); `agents/job_agent.py` `_gate_and_finalize` / `_process_scraped_jd` / `process_company` (`list_location` threaded) | **Write-time geo gate dropped in-scope rows on LLM location formatting.** Blue Origin's Workday JSON-LD location is `"WA - Landmark (Ride East), United States of America"`; Gemini keeps it verbatim for some JDs and rewrites it to `"Landmark (Ride East), WA, …"` for others. The rewritten form → WA → written; the verbatim form → Other → dropped (`TPM III – Software Development`, `Technical Project Manager II`, the `CA - Remote` TeraWave roles) even though the list API had already geo-qualified the same posting ("Greater Seattle Area") pre-scrape. `classify_region` also returned Other for `US - Remote` / `Remote - US` / `Remote (United States)` / `Remote, US, East Coast`. Fix (a): segments are normalized before classification (`- – — / \| ( )` → `, `), a leading state code (`WA,` / `CA,` / `TX,` / `FL,`) maps directly, and the remote rule is token-based (bare "remote" or remote + any `_US_REMOTE_QUALIFIERS` token → Remote; remote + other tokens falls through to the state rules — "Remote, California" → CA, "Remote, Canada" → Other). Fix (b) belt-and-braces: `_gate_and_finalize` receives the list-API `location` (`list_location`, threaded from `process_company`'s `list_meta` via `_process_scraped_jd`) and drops a row only when BOTH the extracted and the list location are out of scope — never on LLM formatting alone; retry path passes none (unchanged strictness). Repro: `TestClassifyRegion.test_leading_state_code_and_separator_variants`, `TestWriteTimeGates.test_list_location_rescues_out_of_scope_extracted_location`. | Fixed |
+
+> **Policy change (not a bug) — REQ-166**: YoE gate now skips only stated min ≥11 (was ≤3 or ≥12). Cowboy Space "Technical Program Manager" (2-5 yrs, Greater Seattle Area) is the motivating case. `TestWriteTimeGates.test_yoe_boundary_table` updated.

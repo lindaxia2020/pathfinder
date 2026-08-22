@@ -24,13 +24,13 @@ You are PathFinder project's observability expert. Your responsibility is to mon
 | Tailored resumes | `tailored_resumes/` | Subdirectories by resume_id |
 | Agent source code | `agents/*.py` | Constants, batch size, concurrency config |
 | Excel Schema | `shared/excel_store.py` | HEADERS constants, worksheet structure |
-| Shared config | `shared/config.py` | MODEL, AUTO_ARCHIVE_THRESHOLD |
+| Shared config | `shared/config.py` | MODEL, TRACK_ORDER, JD_CACHE_DIR |
 
 ### Excel Worksheet Structure Quick Reference
 
 | Worksheet | Primary Key | Key Fields |
 |-----------|-------------|------------|
-| `Company_List` | Company Name | Career URL, TPM Jobs, AI TPM Jobs, No TPM Count, Auto Archived, Updated At |
+| `Company_List` | Company Name | Track, Business Focus, Career URL, Updated At, TPM Jobs, Qualified Jobs |
 | `Company_Without_TPM` | Company Name | (Companies archived for having no TPM jobs) |
 | `JD_Tracker` | JD URL | Job Title, Company, Is AI TPM, Data Quality, Updated At, MD Hash |
 | `Match_Results` | Resume ID + JD URL | Score, Stage (coarse/fine), Resume Hash, Updated At |
@@ -53,7 +53,6 @@ Generate a global overview of pipeline run status based on Excel data.
 | Metric | Calculation Method | Threshold Criteria |
 |--------|--------------------|--------------------|
 | Total companies | Company_List row count | Statistics only |
-| Archived companies | Rows where Auto Archived = True | >50% ratio is warning |
 | Career URL coverage rate | Non-empty Career URL rows / total rows | <80% is warning |
 | No-TPM company archive rate | Company_Without_TPM rows / (List + Without_TPM) | Statistics only |
 

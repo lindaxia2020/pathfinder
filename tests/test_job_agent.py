@@ -1725,169 +1725,24 @@ class TestAtsRoutingTableCompleteness(unittest.TestCase):
         self.assertEqual(set(ATS_PLATFORMS.keys()) & expected, expected)
 
 
-class TestAutoArchiveWorkflow(unittest.TestCase):
-    """REQ-063: Auto-archive companies with no TPM jobs.
+class TestAutoArchiveRemoved(unittest.TestCase):
+    """2026-08-21: auto-archive (REQ-063) removed from the job agent — every
+    Company_List row is processed on every run; no skip list, no counters."""
 
-    Tests the archive workflow logic that runs in main():
-    - Archived companies are skipped
-    - Counter increments when no TPM jobs found
-    - Counter resets when TPM jobs found
-    - Auto-archive triggers at threshold
-    - data_quality='failed' records don't count
-    """
+    def test_no_archive_references_in_job_agent(self):
+        import inspect
+        import agents.job_agent as ja
+        src = inspect.getsource(ja)
+        for token in ("get_archived_companies", "update_archive_status",
+                      "get_company_archive_info", "count_valid_tpm_jobs_by_company",
+                      "AUTO_ARCHIVE_THRESHOLD", "archived_set"):
+            self.assertNotIn(token, src, token)
 
-    def setUp(self):
-        from shared.excel_store import (
-            get_or_create_excel, upsert_companies, upsert_jd_record,
-            get_archived_companies, get_company_archive_info,
-            update_archive_status, count_valid_tpm_jobs_by_company,
-        )
-        self.get_or_create_excel = get_or_create_excel
-        self.upsert_companies = upsert_companies
-        self.upsert_jd_record = upsert_jd_record
-        self.get_archived_companies = get_archived_companies
-        self.get_company_archive_info = get_company_archive_info
-        self.update_archive_status = update_archive_status
-        self.count_valid = count_valid_tpm_jobs_by_company
-
-        import tempfile
-        fd, self.path = tempfile.mkstemp(suffix=".xlsx")
-        os.close(fd)
-        os.remove(self.path)
-        self.get_or_create_excel(self.path)
-        self.upsert_companies(self.path, [
-            {"company_name": "AlphaCo", "ai_domain": "LLM",
-             "business_focus": "AI", "career_url": "https://alpha.co/careers"},
-            {"company_name": "BetaCo", "ai_domain": "Vision",
-             "business_focus": "AI", "career_url": "https://beta.co/careers"},
-        ])
-
-    def tearDown(self):
-        if os.path.exists(self.path):
-            os.remove(self.path)
-
-    def _simulate_archive_phase(self, processed_names):
-        """Reproduce the archive logic from main()."""
-        from shared.config import AUTO_ARCHIVE_THRESHOLD
-        valid_counts = self.count_valid(self.path)
-        archive_info = self.get_company_archive_info(self.path)
-        for cname in processed_names:
-            has_tpm = valid_counts.get(cname, 0) > 0
-            info = archive_info.get(cname, {"no_tpm_count": 0, "archived": ""})
-            if has_tpm:
-                if info["no_tpm_count"] > 0 or info["archived"] == "yes":
-                    self.update_archive_status(self.path, cname, 0, "no")
-            else:
-                new_count = info["no_tpm_count"] + 1
-                if new_count >= AUTO_ARCHIVE_THRESHOLD:
-                    self.update_archive_status(self.path, cname, new_count, "yes")
-                else:
-                    self.update_archive_status(self.path, cname, new_count, "no")
-
-    def test_archived_company_skipped(self):
-        """Archived companies should be filtered out of the company list."""
-        self.update_archive_status(self.path, "AlphaCo", 3, "yes")
-        archived = self.get_archived_companies(self.path)
-        companies = [
-            ["AlphaCo", "LLM", "AI", "https://alpha.co/careers"],
-            ["BetaCo", "Vision", "AI", "https://beta.co/careers"],
-        ]
-        filtered = [r for r in companies if str(r[0]).strip() not in archived]
-        self.assertEqual(len(filtered), 1)
-        self.assertEqual(filtered[0][0], "BetaCo")
-
-    def test_counter_increments_no_tpm(self):
-        """Counter increments when company has no TPM jobs."""
-        self._simulate_archive_phase({"AlphaCo"})
-        info = self.get_company_archive_info(self.path)
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], 1)
-        self.assertEqual(info["AlphaCo"]["archived"], "no")
-
-    def test_counter_resets_with_tpm_jobs(self):
-        """Counter resets to 0 when TPM jobs are found."""
-        self.update_archive_status(self.path, "AlphaCo", 2, "no")
-        # Add a valid TPM job for AlphaCo
-        jd = json.dumps({
-            "job_title": "TPM", "company": "AlphaCo", "location": "Remote",
-            "salary_range": "N/A", "requirements": ["Python"],
-            "additional_qualifications": [],
-            "key_responsibilities": ["Lead"], "is_ai_tpm": True,
-            "data_quality": "complete",
-        })
-        self.upsert_jd_record(self.path, "https://alpha.co/j/1", jd, "h1")
-        self._simulate_archive_phase({"AlphaCo"})
-        info = self.get_company_archive_info(self.path)
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], 0)
-        self.assertEqual(info["AlphaCo"]["archived"], "no")
-
-    def test_auto_archive_at_threshold(self):
-        """Company auto-archived after N consecutive runs with no TPM jobs."""
-        from shared.config import AUTO_ARCHIVE_THRESHOLD
-        self.update_archive_status(self.path, "AlphaCo",
-                                   AUTO_ARCHIVE_THRESHOLD - 1, "no")
-        self._simulate_archive_phase({"AlphaCo"})
-        info = self.get_company_archive_info(self.path)
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], AUTO_ARCHIVE_THRESHOLD)
-        self.assertEqual(info["AlphaCo"]["archived"], "yes")
-
-    def test_failed_records_not_counted(self):
-        """data_quality='failed' records should not count as TPM jobs."""
-        jd_fail = json.dumps({
-            "job_title": "TPM", "company": "AlphaCo", "location": "",
-            "salary_range": "N/A", "requirements": [],
-            "additional_qualifications": [],
-            "key_responsibilities": [], "is_ai_tpm": False,
-            "data_quality": "failed",
-        })
-        self.upsert_jd_record(self.path, "https://alpha.co/j/1", jd_fail, "h1")
-        self.update_archive_status(self.path, "AlphaCo", 2, "no")
-        self._simulate_archive_phase({"AlphaCo"})
-        info = self.get_company_archive_info(self.path)
-        # Still incremented because the failed record doesn't count
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], 3)
-
-    def test_threshold_constant_exists(self):
-        from shared.config import AUTO_ARCHIVE_THRESHOLD
-        self.assertIsInstance(AUTO_ARCHIVE_THRESHOLD, int)
-        self.assertGreater(AUTO_ARCHIVE_THRESHOLD, 0)
-
-    def test_multiple_runs_increment(self):
-        """Simulate 3 consecutive runs with no TPM jobs."""
-        from shared.config import AUTO_ARCHIVE_THRESHOLD
-        for run in range(AUTO_ARCHIVE_THRESHOLD):
-            self._simulate_archive_phase({"AlphaCo"})
-        info = self.get_company_archive_info(self.path)
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], AUTO_ARCHIVE_THRESHOLD)
-        self.assertEqual(info["AlphaCo"]["archived"], "yes")
-        # Should be in archived set
-        self.assertIn("AlphaCo", self.get_archived_companies(self.path))
-
-    def test_unarchive_restores_company(self):
-        """After unarchive, company should be processed again."""
-        from shared.excel_store import unarchive_company
-        self.update_archive_status(self.path, "AlphaCo", 3, "yes")
-        self.assertIn("AlphaCo", self.get_archived_companies(self.path))
-        unarchive_company(self.path, "AlphaCo")
-        self.assertNotIn("AlphaCo", self.get_archived_companies(self.path))
-        info = self.get_company_archive_info(self.path)
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], 0)
-
-    def test_partial_quality_counts_as_tpm(self):
-        """data_quality='partial' records should count as TPM jobs."""
-        self.update_archive_status(self.path, "AlphaCo", 2, "no")
-        jd_partial = json.dumps({
-            "job_title": "TPM", "company": "AlphaCo", "location": "",
-            "salary_range": "N/A", "requirements": ["Python"],
-            "additional_qualifications": [],
-            "key_responsibilities": ["Lead"], "is_ai_tpm": True,
-            "data_quality": "partial",
-        })
-        self.upsert_jd_record(self.path, "https://alpha.co/j/1", jd_partial, "h1")
-        self._simulate_archive_phase({"AlphaCo"})
-        info = self.get_company_archive_info(self.path)
-        # Should reset because partial counts
-        self.assertEqual(info["AlphaCo"]["no_tpm_count"], 0)
-        self.assertEqual(info["AlphaCo"]["archived"], "no")
+    def test_main_does_not_filter_companies_by_archive(self):
+        import inspect
+        from agents.job_agent import _main_inner
+        src = inspect.getsource(_main_inner)
+        self.assertNotIn("archiv", src.lower())
 
 
 class TestBug53FmtAddrOutsideLoop(unittest.TestCase):
@@ -2183,6 +2038,45 @@ class TestWorkdayPagination(unittest.TestCase):
             results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
         self.assertEqual(len(results), 20)
 
+    def test_total_only_on_first_page_does_not_stop_pagination(self):
+        # BUG-81: Workday CXS returns the real `total` on page 0 only — later
+        # pages carry total=0, which tripped `offset >= total` after page 2
+        # and capped every Workday company at 40 postings.
+        from agents.job_agent import _fetch_workday_jobs
+        pages = [self._page(20, 0, total=55), self._page(20, 20, total=0),
+                 self._page(15, 40, total=0)]
+        with patch("agents.job_agent._http_request_with_retry", side_effect=pages) as mock_http:
+            results = _fetch_workday_jobs("https://co.myworkdayjobs.com/site")
+        self.assertEqual(mock_http.call_count, 3)
+        self.assertEqual(len(results), 55)
+
+    def test_locale_segment_skipped_in_api_path(self):
+        # BUG-80: "/en-US/<site>" URLs (13 of 28 Workday rows — Salesforce,
+        # Zillow, Blue Origin, ...) took "en-US" as the site slug → CXS 404 →
+        # zero postings. The locale segment is not part of the site slug.
+        from agents.job_agent import _fetch_workday_jobs
+        cases = {
+            "https://blueorigin.wd5.myworkdayjobs.com/en-US/BlueOrigin":
+                "https://blueorigin.wd5.myworkdayjobs.com/wday/cxs/blueorigin/BlueOrigin/jobs",
+            "https://zillow.wd5.myworkdayjobs.com/en-US/Zillow_Group_External?q=tpm":
+                "https://zillow.wd5.myworkdayjobs.com/wday/cxs/zillow/Zillow_Group_External/jobs",
+            "https://co.myworkdayjobs.com/fr-CA/Site/details/x":
+                "https://co.myworkdayjobs.com/wday/cxs/co/Site/jobs",
+            # no locale → unchanged behaviour
+            "https://nvidia.wd5.myworkdayjobs.com/NVIDIAExternalCareerSite":
+                "https://nvidia.wd5.myworkdayjobs.com/wday/cxs/nvidia/NVIDIAExternalCareerSite/jobs",
+        }
+        for url, expected_api in cases.items():
+            with self.subTest(url=url), \
+                 patch("agents.job_agent._http_request_with_retry",
+                       side_effect=[self._page(1)]) as mock_http:
+                results = _fetch_workday_jobs(url)
+            self.assertEqual(mock_http.call_args.args[1], expected_api)
+            self.assertEqual(len(results), 1)
+            # job URLs are built off the site, never off the locale segment
+            self.assertNotIn("/en-US/", results[0]["url"])
+            self.assertNotIn("/fr-CA/", results[0]["url"])
+
 
 class TestParseWorkdayPostedOn(unittest.TestCase):
     """REQ-004-10: deterministic postedOn relative-string parser."""
@@ -2247,7 +2141,7 @@ class TestWriteTimeGates(unittest.IsolatedAsyncioTestCase):
     }
 
     async def _run(self, overrides: dict, track="AI-native", posted_date="",
-                   label="generic"):
+                   label="generic", list_location=""):
         import json as _json
         from agents.job_agent import _process_scraped_jd
         parsed = {**self.BASE, **overrides}
@@ -2259,15 +2153,31 @@ class TestWriteTimeGates(unittest.IsolatedAsyncioTestCase):
             await _process_scraped_jd(
                 "https://x.co/jd", "# markdown", "TestCo", track,
                 set(), {}, pending, ts_only, label,
-                posted_date=posted_date,
+                posted_date=posted_date, list_location=list_location,
             )
         return pending
 
     async def test_yoe_boundary_table(self):
-        # (min_yoe, kept?) — B2: keep [4,10]; skip ≤3 and ≥12.
-        for yoe, kept in [(3, False), (4, True), (10, True), (12, False)]:
+        # (min_yoe, kept?) — REQ-166 (2026-08-21): no lower cut (a stated
+        # "2-5 yrs" startup TPM is in scope); skip only stated min ≥11.
+        for yoe, kept in [(0, True), (2, True), (3, True), (4, True),
+                          (10, True), (11, False), (12, False), (15, False)]:
             pending = await self._run({"min_yoe": yoe})
             self.assertEqual(bool(pending), kept, f"min_yoe={yoe}")
+
+    async def test_list_location_rescues_out_of_scope_extracted_location(self):
+        # BUG-82 belt-and-braces: the list API already geo-qualified the row
+        # pre-scrape ("Greater Seattle Area"); if Gemini's extracted location
+        # string classifies Other, the row is kept when the list-level
+        # location is in scope — and still dropped when neither is.
+        kept = await self._run({"location": "Nowhere Campus Bldg 7"},
+                               list_location="Greater Seattle Area")
+        self.assertTrue(kept)
+        dropped = await self._run({"location": "Nowhere Campus Bldg 7"},
+                                  list_location="London, UK")
+        self.assertFalse(dropped)
+        dropped2 = await self._run({"location": "Nowhere Campus Bldg 7"})
+        self.assertFalse(dropped2)
 
     async def test_yoe_unstated_senior_title_auto_qualifies(self):
         import json as _json

@@ -3,8 +3,6 @@ import os
 
 MODEL = "gemini-3.5-flash-lite"
 
-AUTO_ARCHIVE_THRESHOLD = 3  # consecutive no-TPM runs before auto-archiving a company
-
 # PRJ-004 6-track taxonomy, in canonical display/sort order. Single source of
 # truth shared by company_agent (quotas/schemas) and excel_store (Company_List
 # sort) — defined here to avoid a circular import between those two modules.

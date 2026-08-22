@@ -1,5 +1,50 @@
 # Task Tracker
 
+## Open follow-ups (as of 2026-08-21 — each is its own small plan; start a fresh session per item)
+
+Context: all items below were found during the 2026-08-20/21 job-agent result review (BUG-79~82, REQ-163~166 — see CHANGELOG 2026-08-20/21). Code for those is in the working tree (commit it first if not yet committed).
+
+- [ ] **Google labeling** (`agents/job_agent.py:_fetch_google_jobs`): ignores the Career URL's `company=` param and searches all of Google US → the first-processed Google row ("Google DeepMind", AI-native) absorbs all ~51 Google-wide TPM postings (0 titles mention DeepMind); the "Google" (Mid-large Tech) row then finds nothing new; Job Domain forced "AI"; plain-PM titles leak via the AI-native rule. Fix idea: honor `company=` (filter payload rows by company field) or merge the two rows.
+- [ ] **Microsoft list adapter**: `careers.microsoft.com` routes to Path B (Firecrawl + Crawl4AI on a JS SPA) → ~nothing (1 row total). Needs an adapter like Amazon/Google. `gcsservices.careers.microsoft.com/search/api/v1/search` gave a TLS name mismatch from this host on 2026-08-20 — find the endpoint the SPA actually calls. Locations are "City, Washington, United States" (now handled by BUG-79).
+- [ ] **Freshness gate policy**: ≥15-day-old postings are never written on first sight (`_apply_prescrape_freshness_gate`, REQ-004-10). Cowboy Space "TPM, Avionics" (07-17) was lost this way. Decide whether small/vertical companies get a longer first-seen window.
+- [ ] **Salesforce Workday sanity**: `searchText="Program Manager"` returns 421 postings but 0 TPM titles after `_tpm_filter` — verify the search covers "Technical Program Manager" titles (compare with a direct `searchText="Technical Program Manager"` probe).
+- [ ] **Ashby prefetched JD**: the Ashby job-board API already returns `descriptionHtml`; carrying it as `_prefetched_md` (like Amazon) would remove the Crawl4AI render for Ashby JDs (Cowboy Space took 3 browser passes). Optimization, low priority.
+
+## Completed (2026-08-21): Auto-archive feature removed (REQ-167)
+
+**Trigger**: user decision — never skip a company (new openings appear any time); the REQ-063 archiver was also one bug-affected run away from silently archiving 334 companies, and counted triaged-out companies as "no jobs".
+
+- [x] `agents/job_agent.py`: archive skip list + post-run archive phase removed, imports cleaned
+- [x] `shared/excel_store.py`: 5 archive helpers deleted; `COMPANY_HEADERS` 7 cols; migration strips legacy `No TPM Count`/`Auto Archived` columns (`_LEGACY_ARCHIVE_COLUMNS`); `upsert_companies` defaults `[0, 0]`
+- [x] `shared/config.py`: `AUTO_ARCHIVE_THRESHOLD` removed
+- [x] Tests: REQ-063 classes → `TestAutoArchiveRemoved` (excel_store + job_agent); P0-5 / column-count tests adapted
+- [x] Workbook migrated (backup `pathfinder_dashboard.backup-20260821.xlsx`)
+- [x] Docs: REQUIREMENTS §9.16 REQ-167 (+REQ-063 marked removed, REQ-029 note, v2.10), ARCHITECTURE v2.5, CLAUDE.md, `.claude/agents/observability.md`, CHANGELOG
+
+## Completed (2026-08-21): Result review round 2 — BUG-82 + YoE policy REQ-166
+
+**Trigger**: after the 08-20 fixes re-run, Cowboy Space 08-14 TPM and most Blue Origin WA TPMs were still absent. Reproduced scrape → extract → gate offline per JD.
+
+- [x] Diagnosis: Cowboy Space = YoE gate (2-5 yrs → min 2 ≤ 3, by design); Blue Origin = write-time geo drop on verbatim `"WA - Landmark (Ride East), …"` (LLM formatting), plus `CA - Remote` / `US - Remote` forms → Other
+- [x] BUG-82 `classify_region`: separator normalization, leading state code, token-based remote rule (`Remote, Canada` still Other)
+- [x] BUG-82 `_gate_and_finalize(list_location=…)`: drop only when extracted AND list-API locations are both out of scope (threaded from `process_company` list_meta)
+- [x] REQ-166: YoE gate skip only stated min ≥11 (was ≤3 or ≥12)
+- [x] Tests first (5 failing → green), full suite
+- [x] Docs: BUGS (BUG-82 + policy note), CHANGELOG, REQUIREMENTS §9.15 (REQ-165/166, v2.9), ARCHITECTURE v2.4
+
+## Completed (2026-08-20): Job-agent result review → recall fixes (BUG-79~81)
+
+**Trigger**: user reviewed the 2026-08-19 manual job_agent run — Seattle big tech under-counted, Cowboy Space TPM missing.
+
+- [x] Review: run completed normally (378 companies, 143 JD rows); root-caused via live API probes (Amazon search.json, Ashby, Workday CXS)
+- [x] BUG-79 `classify_region`: full-state-name WA forms + WA city hints (D.C.-guarded, other-state veto); CA/TX/FL tokens word-bounded (", canada" ≠ CA)
+- [x] BUG-80 `_fetch_workday_jobs`: skip `/en-US/` locale segment in site slug (13/28 Workday rows were 404 → 0 jobs)
+- [x] BUG-81 `_fetch_workday_jobs`: `total` from page 0 only (later pages report 0) — pagination was capped at 40 for every Workday company
+- [x] Repro tests first (3 failing → green); full suite run
+- [x] Docs: BUGS (BUG-79~81 + summary), CHANGELOG, REQUIREMENTS §9.14 (REQ-163/164, v2.8), ARCHITECTURE v2.3, lessons
+- [ ] Follow-ups — see "## Open follow-ups" section at top of this file
+
+
 ## Completed (2026-08-19): Filter widening — titles + WA geo (REQ-160/161)
 
 **Trigger**: user decision — leave more results at the cheap title/geo pre-filter; write-time gates keep final precision.
